@@ -1,0 +1,7 @@
+*.log
+*.csv
+*.pst
+.env
+*.bak
+.DS_Store
+Thumbs.db

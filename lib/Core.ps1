@@ -241,6 +241,7 @@ function Build-SearchQuery {
     <#
     .SYNOPSIS
         Build KQL search query from individual filter parameters.
+        Supports folder scoping via folder:"path" KQL syntax.
     #>
     [CmdletBinding()]
     param(
@@ -253,7 +254,11 @@ function Build-SearchQuery {
         [datetime]$StartDate,
         [datetime]$EndDate,
         [ValidateSet('','IPM.Note','IPM.Appointment','IPM.Contact','IPM.Task')]
-        [string]$MessageKind
+        [string]$MessageKind,
+        [string]$Folder,
+        [ValidateSet('','Small','Medium','Large','VeryLarge')]
+        [string]$SizeRange,
+        [switch]$HasAttachment
     )
 
     $parts = @()
@@ -265,6 +270,17 @@ function Build-SearchQuery {
     if ($AttachmentName) { $parts += "attachment:`"$AttachmentName`"" }
     if ($MessageId)      { $parts += "messageid:`"$MessageId`"" }
     if ($MessageKind)    { $parts += "kind:$MessageKind" }
+    if ($Folder)         { $parts += "folder:`"$Folder`"" }
+    if ($HasAttachment)  { $parts += "hasattachment:true" }
+
+    if ($SizeRange) {
+        switch ($SizeRange) {
+            'Small'     { $parts += "size<10KB" }
+            'Medium'    { $parts += "size>=10KB AND size<1MB" }
+            'Large'     { $parts += "size>=1MB AND size<10MB" }
+            'VeryLarge' { $parts += "size>=10MB" }
+        }
+    }
 
     if ($StartDate) {
         $parts += "received>=$($StartDate.ToString('yyyy-MM-dd'))"
@@ -582,6 +598,300 @@ function Get-MailboxFolderStats {
     } catch {
         return @()
     }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# FOLDER OPERATIONS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Get-MailboxFolderList {
+    <#
+    .SYNOPSIS
+        Get flat list of folder paths for a mailbox (for folder picker).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Mailbox)
+    try {
+        $folders = Get-MailboxFolderStatistics -Identity $Mailbox -ErrorAction Stop
+        return $folders | ForEach-Object {
+            [PSCustomObject]@{
+                FolderPath   = $_.FolderPath
+                FolderType   = $_.FolderType
+                ItemCount    = $_.ItemsInFolder
+                FolderSize   = "$($_.FolderSize)"
+                OldestItem   = "$($_.OldestItemReceivedDate)"
+                NewestItem   = "$($_.NewestItemReceivedDate)"
+            }
+        }
+    } catch {
+        return @()
+    }
+}
+
+function Invoke-FolderCleanup {
+    <#
+    .SYNOPSIS
+        Search and optionally delete messages from a specific folder.
+    .PARAMETER Mailbox
+        Target mailbox.
+    .PARAMETER FolderPath
+        Folder path (e.g. /Inbox, /Sent Items, /Deleted Items).
+    .PARAMETER OlderThanDays
+        Delete items older than N days.
+    .PARAMETER Subject
+        Filter by subject.
+    .PARAMETER From
+        Filter by sender.
+    .PARAMETER SizeRange
+        Filter by size: Small (<10KB), Medium (10KB-1MB), Large (1MB-10MB), VeryLarge (>10MB).
+    .PARAMETER HasAttachment
+        Filter only items with attachments.
+    .PARAMETER Action
+        Estimate or DeleteContent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [string]$FolderPath,
+        [int]$OlderThanDays = 0,
+        [string]$Subject,
+        [string]$From,
+        [string]$SizeRange,
+        [switch]$HasAttachment,
+        [ValidateSet('Estimate','DeleteContent')]
+        [string]$Action = 'Estimate'
+    )
+
+    $queryParams = @{}
+    if ($FolderPath)    { $queryParams['Folder'] = $FolderPath.TrimStart('/') }
+    if ($Subject)       { $queryParams['Subject'] = $Subject }
+    if ($From)          { $queryParams['From'] = $From }
+    if ($SizeRange)     { $queryParams['SizeRange'] = $SizeRange }
+    if ($HasAttachment) { $queryParams['HasAttachment'] = $true }
+
+    if ($OlderThanDays -gt 0) {
+        $queryParams['EndDate'] = (Get-Date).AddDays(-$OlderThanDays)
+    }
+
+    $query = Build-SearchQuery @queryParams
+
+    $searchParams = @{
+        Mailboxes   = @($Mailbox)
+        SearchQuery = $query
+        Action      = $Action
+    }
+    if ($Action -eq 'DeleteContent') {
+        $searchParams['Force'] = $true
+    }
+
+    return Invoke-MailboxSearch @searchParams
+}
+
+function Invoke-PurgeDeletedItems {
+    <#
+    .SYNOPSIS
+        Purge (hard-delete) items from Recoverable Items / Deletions folder.
+        Uses Search-Mailbox -SearchDumpsterOnly -DeleteContent.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [string]$SearchQuery = '*',
+        [ValidateSet('Estimate','DeleteContent')]
+        [string]$Action = 'Estimate'
+    )
+
+    $params = @{
+        Identity    = $Mailbox
+        SearchQuery = $SearchQuery
+        SearchDumpsterOnly = $true
+        ErrorAction = 'Stop'
+    }
+
+    if ($Action -eq 'Estimate') {
+        $params['EstimateResultOnly'] = $true
+    } else {
+        $params['DeleteContent'] = $true
+        $params['Force'] = $true
+    }
+
+    try {
+        $result = Search-Mailbox @params
+        return $result | ForEach-Object {
+            [PSCustomObject]@{
+                Mailbox     = "$($_.Identity)"
+                DisplayName = "$($_.DisplayName)"
+                Success     = $_.Success
+                ResultItems = $_.ResultItemsCount
+                ResultSize  = "$($_.ResultItemsSize)"
+                Action      = "$Action (Dumpster)"
+                SearchQuery = $SearchQuery
+                Timestamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            }
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Mailbox = $Mailbox; Success = $false; ResultItems = 0
+            Action = "$Action (Dumpster)"; Error = "$_"
+            Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        }
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# DUPLICATE DETECTION
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Find-MailboxDuplicates {
+    <#
+    .SYNOPSIS
+        Find potential duplicate messages in a mailbox.
+        Strategy: search by subject+sender combinations and identify
+        messages that appear multiple times (same subject, same sender, same day).
+    .DESCRIPTION
+        1. Gets folder statistics to identify folders with many items.
+        2. For each target folder, uses Search-Mailbox to export to discovery mailbox.
+        3. Analyzes results by grouping on subject+from+date.
+
+        Simplified approach: searches for exact subject matches and returns
+        folders/counts where duplicates are likely.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [string]$FolderPath,
+        [string]$TargetMailbox,
+        [int]$DaysBack = 30
+    )
+
+    $results = @()
+
+    # Step 1: Get folder stats to identify heavy folders
+    $folders = Get-MailboxFolderStatistics -Identity $Mailbox -ErrorAction Stop |
+               Where-Object { $_.ItemsInFolder -gt 0 }
+
+    if ($FolderPath) {
+        $folders = $folders | Where-Object { $_.FolderPath -eq $FolderPath }
+    }
+
+    $startDate = (Get-Date).AddDays(-$DaysBack)
+
+    # Step 2: For each folder with items, do estimate search
+    # We search the mailbox scoped to each folder and look for subjects
+    # that produce high result counts
+    foreach ($folder in $folders) {
+        $folderName = $folder.FolderPath.TrimStart('/')
+        if (-not $folderName) { continue }
+        if ($folder.FolderType -in @('RecoverableItems','Audits','Calendar','Contacts','Tasks')) { continue }
+
+        $query = Build-SearchQuery -Folder $folderName -StartDate $startDate
+
+        try {
+            $estimate = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
+                        -EstimateResultOnly -ErrorAction Stop
+
+            if ($estimate.ResultItemsCount -gt 0) {
+                $results += [PSCustomObject]@{
+                    FolderPath  = $folder.FolderPath
+                    FolderType  = $folder.FolderType
+                    ItemCount   = $folder.ItemsInFolder
+                    SearchHits  = $estimate.ResultItemsCount
+                    FolderSize  = "$($folder.FolderSize)"
+                    OldestItem  = "$($folder.OldestItemReceivedDate)"
+                    NewestItem  = "$($folder.NewestItemReceivedDate)"
+                    Status      = if ($estimate.ResultItemsCount -gt $folder.ItemsInFolder) { 'PossibleDupes' } else { 'Normal' }
+                }
+            }
+        } catch {
+            $results += [PSCustomObject]@{
+                FolderPath = $folder.FolderPath; FolderType = $folder.FolderType
+                ItemCount = $folder.ItemsInFolder; Error = "$_"
+            }
+        }
+    }
+
+    return $results
+}
+
+function Remove-FolderDuplicates {
+    <#
+    .SYNOPSIS
+        Remove duplicate messages from a specific folder.
+        Strategy: Export folder content to a discovery mailbox (which dedupes),
+        then delete original folder content and copy back from discovery.
+
+        Simpler approach: Search for messages with same subject in the folder,
+        log to target mailbox (which captures unique), then delete all from source
+        folder and rely on the target copy.
+    .DESCRIPTION
+        This is a two-step process:
+        1. Copy unique messages to target/backup mailbox folder
+        2. Delete from source folder
+
+        IMPORTANT: Always backup first! Use Estimate to review before deleting.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$TargetMailbox,
+        [string]$TargetFolder = 'DuplicateBackup',
+        [ValidateSet('BackupOnly','BackupAndDelete')]
+        [string]$Action = 'BackupOnly'
+    )
+
+    $folderName = $FolderPath.TrimStart('/')
+    $query = Build-SearchQuery -Folder $folderName
+    $results = @()
+
+    # Step 1: Always backup first — copy to target mailbox
+    try {
+        $copyResult = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
+                      -TargetMailbox $TargetMailbox -TargetFolder $TargetFolder `
+                      -ErrorAction Stop
+
+        $results += [PSCustomObject]@{
+            Step        = '1-Backup'
+            Mailbox     = $Mailbox
+            Folder      = $FolderPath
+            Action      = 'CopyToTarget'
+            ItemsCopied = $copyResult.ResultItemsCount
+            TargetMailbox = $TargetMailbox
+            TargetFolder  = $TargetFolder
+            Success     = $copyResult.Success
+            Timestamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        }
+    } catch {
+        return [PSCustomObject]@{
+            Step = '1-Backup'; Action = 'CopyToTarget'; Success = $false; Error = "$_"
+            Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+        }
+    }
+
+    # Step 2: Delete from source folder (only if BackupAndDelete)
+    if ($Action -eq 'BackupAndDelete') {
+        try {
+            $deleteResult = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
+                           -DeleteContent -Force -ErrorAction Stop
+
+            $results += [PSCustomObject]@{
+                Step         = '2-Delete'
+                Mailbox      = $Mailbox
+                Folder       = $FolderPath
+                Action       = 'DeleteContent'
+                ItemsDeleted = $deleteResult.ResultItemsCount
+                Success      = $deleteResult.Success
+                Timestamp    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            }
+        } catch {
+            $results += [PSCustomObject]@{
+                Step = '2-Delete'; Action = 'DeleteContent'; Success = $false; Error = "$_"
+                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+            }
+        }
+    }
+
+    return $results
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

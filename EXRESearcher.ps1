@@ -6,7 +6,7 @@
     and organization-wide message deletion (phishing/malware cleanup).
     All Exchange operations run asynchronously via runspaces.
 .NOTES
-    Version: 1.0.0
+    Version: 1.1.0
     Requires: Exchange 2019 SE, Windows PowerShell 5.1
 #>
 
@@ -34,6 +34,8 @@ $script:LastOrgResults         = @()
 $script:LastStatsData          = @()
 $script:LastFolderStats        = @()
 $script:LastAuditLog           = @()
+$script:LastFolderCleanup     = @()
+$script:LastDuplicates        = @()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # GUI HELPERS
@@ -181,7 +183,7 @@ function Set-DGVData {
 function Show-EXRESearcherGUI {
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'EXRESearcher v1.0 — Exchange Content Search & Cleanup'
+    $form.Text = 'EXRESearcher v1.1 — Exchange Content Search & Cleanup'
     $form.Size = New-Object System.Drawing.Size(1400, 900)
     $form.MinimumSize = New-Object System.Drawing.Size(1100, 700)
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -1098,8 +1100,376 @@ function Show-EXRESearcherGUI {
 
     $btnAuditExport.Add_Click({ Show-Export -Data $script:LastAuditLog -DefaultName 'audit-log' })
 
+    # ═══════════════════════════════════════════════════════════════════════════
+    # TAB 6: FOLDER CLEANUP & DUPLICATES
+    # ═══════════════════════════════════════════════════════════════════════════
+    $tabFolder = New-Object System.Windows.Forms.TabPage
+    $tabFolder.Text = 'Folder Cleanup'
+
+    $folderPanel = New-Object System.Windows.Forms.Panel
+    $folderPanel.Dock = 'Fill'
+
+    # --- Row 1: Mailbox + Folder ---
+    $folderBar1 = New-FlowBar -H 38
+    $lblFcMailbox = New-InlineLabel -Text 'Mailbox:'
+    $txtFcMailbox = New-Object System.Windows.Forms.TextBox
+    $txtFcMailbox.Width = 220; $txtFcMailbox.Height = 24
+    $txtFcMailbox.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $lblFcFolder = New-InlineLabel -Text 'Folder:'
+    $cmbFcFolder = New-Object System.Windows.Forms.ComboBox
+    $cmbFcFolder.Width = 220; $cmbFcFolder.DropDownStyle = 'DropDown'
+    $cmbFcFolder.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $btnFcLoadFolders = New-Btn -Text 'Load Folders' -W 100 -Color 'Blue'
+    $folderBar1.Controls.AddRange(@($lblFcMailbox, $txtFcMailbox, $lblFcFolder, $cmbFcFolder, $btnFcLoadFolders))
+
+    # --- Row 2: Filters ---
+    $folderBar2 = New-FlowBar -H 38
+    $lblFcSubject = New-InlineLabel -Text 'Subject:'
+    $txtFcSubject = New-Object System.Windows.Forms.TextBox
+    $txtFcSubject.Width = 160; $txtFcSubject.Height = 24
+    $txtFcSubject.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $lblFcFrom = New-InlineLabel -Text 'From:'
+    $txtFcFrom = New-Object System.Windows.Forms.TextBox
+    $txtFcFrom.Width = 160; $txtFcFrom.Height = 24
+    $txtFcFrom.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $lblFcOlder = New-InlineLabel -Text 'Older than (days):'
+    $numFcDays = New-Object System.Windows.Forms.NumericUpDown
+    $numFcDays.Width = 70; $numFcDays.Minimum = 0; $numFcDays.Maximum = 3650; $numFcDays.Value = 0
+    $numFcDays.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $lblFcSize = New-InlineLabel -Text 'Size:'
+    $cmbFcSize = New-Object System.Windows.Forms.ComboBox
+    $cmbFcSize.Width = 100; $cmbFcSize.DropDownStyle = 'DropDownList'
+    $cmbFcSize.Items.AddRange(@('Any','Small','Medium','Large','VeryLarge'))
+    $cmbFcSize.SelectedIndex = 0
+    $cmbFcSize.Margin = New-Object System.Windows.Forms.Padding(3,6,8,4)
+    $chkFcAttach = New-Object System.Windows.Forms.CheckBox
+    $chkFcAttach.Text = 'Has Attachment'
+    $chkFcAttach.AutoSize = $true
+    $chkFcAttach.Margin = New-Object System.Windows.Forms.Padding(8,8,4,4)
+    $folderBar2.Controls.AddRange(@($lblFcSubject, $txtFcSubject, $lblFcFrom, $txtFcFrom, $lblFcOlder, $numFcDays, $lblFcSize, $cmbFcSize, $chkFcAttach))
+
+    # --- Row 3: Actions ---
+    $folderBar3 = New-FlowBar -H 38
+    $btnFcEstimate = New-Btn -Text 'Estimate' -W 100 -Color 'Blue'
+    $btnFcDelete = New-Btn -Text 'Delete' -W 100 -Color 'Red'
+    $btnFcPurge = New-Btn -Text 'Purge Dumpster' -W 120 -Color 'Orange'
+    $lblFcSep = New-InlineLabel -Text '|' -MarginLeft 10
+    $btnFcFindDupes = New-Btn -Text 'Find Duplicates' -W 120 -Color 'Green'
+    $btnFcBackupDupes = New-Btn -Text 'Backup Folder' -W 110
+    $btnFcRemoveDupes = New-Btn -Text 'Backup + Delete' -W 120 -Color 'Red'
+    $lblFcTarget = New-InlineLabel -Text 'Target:' -MarginLeft 10
+    $txtFcTarget = New-Object System.Windows.Forms.TextBox
+    $txtFcTarget.Width = 180; $txtFcTarget.Height = 24
+    $txtFcTarget.Margin = New-Object System.Windows.Forms.Padding(3,6,3,4)
+    $btnFcExport = New-Btn -Text 'Export...' -W 80
+    $folderBar3.Controls.AddRange(@($btnFcEstimate, $btnFcDelete, $btnFcPurge, $lblFcSep, $btnFcFindDupes, $btnFcBackupDupes, $btnFcRemoveDupes, $lblFcTarget, $txtFcTarget, $btnFcExport))
+
+    $dgvFolder = New-StyledDGV
+    $dgvFolder.Add_CellFormatting({
+        param($s, $e)
+        try {
+            if ($e.RowIndex -lt 0) { return }
+            $row = $s.Rows[$e.RowIndex]
+            $statusCol = $null
+            foreach ($c in $s.Columns) { if ($c.Name -eq 'Status') { $statusCol = $c.Index; break } }
+            if ($null -ne $statusCol) {
+                $val = "$($row.Cells[$statusCol].Value)"
+                if ($val -eq 'PossibleDupes') { $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255,230,200) }
+            }
+            $actionCol = $null
+            foreach ($c in $s.Columns) { if ($c.Name -eq 'Action') { $actionCol = $c.Index; break } }
+            if ($null -ne $actionCol) {
+                $val = "$($row.Cells[$actionCol].Value)"
+                if ($val -match 'Delete')  { $row.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(255,200,200) }
+            }
+        } catch {}
+    })
+
+    $folderPanel.Controls.Add($dgvFolder)
+    $folderPanel.Controls.Add($folderBar3)
+    $folderPanel.Controls.Add($folderBar2)
+    $folderPanel.Controls.Add($folderBar1)
+    $tabFolder.Controls.Add($folderPanel)
+
+    # --- Folder Cleanup Events ---
+    $btnFcLoadFolders.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        if (-not $mbx) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
+            return
+        }
+        Update-StatusBar "Loading folders for $mbx..."
+        $btnFcLoadFolders.Enabled = $false
+        Start-AsyncJob -Name "Folders $mbx" -Form $form -ScriptBlock {
+            param($Mailbox)
+            Get-MailboxFolderList -Mailbox $Mailbox
+        } -Parameters @{ Mailbox = $mbx } -OnComplete {
+            param($result)
+            try {
+                $cmbFcFolder.Items.Clear()
+                $cmbFcFolder.Items.Add('(All Folders)')
+                foreach ($f in $result) {
+                    $cmbFcFolder.Items.Add($f.FolderPath)
+                }
+                $cmbFcFolder.SelectedIndex = 0
+                Set-DGVData -DGV $dgvFolder -Data $result
+                $script:LastFolderCleanup = $result
+                Update-StatusBar "Loaded $($result.Count) folders for $mbx"
+            } catch { Update-StatusBar "Folder load error: $_" }
+            $btnFcLoadFolders.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcLoadFolders.Enabled = $true
+            Update-StatusBar "Folder load error: $err"
+        }
+    })
+
+    $btnFcEstimate.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        if (-not $mbx) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
+            return
+        }
+        $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        $subj = $txtFcSubject.Text.Trim()
+        $frm = $txtFcFrom.Text.Trim()
+        $days = [int]$numFcDays.Value
+        $sz = if ($cmbFcSize.SelectedItem -and $cmbFcSize.SelectedItem -ne 'Any') { $cmbFcSize.SelectedItem } else { '' }
+        $att = $chkFcAttach.Checked
+        Update-StatusBar "Estimating folder cleanup for $mbx..."
+        $btnFcEstimate.Enabled = $false
+
+        Start-AsyncJob -Name "Folder Estimate $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment)
+            $p = @{ Mailbox = $Mailbox; Action = 'Estimate' }
+            if ($FolderPath)    { $p['FolderPath'] = $FolderPath }
+            if ($Subject)       { $p['Subject'] = $Subject }
+            if ($From)          { $p['From'] = $From }
+            if ($OlderThanDays -gt 0) { $p['OlderThanDays'] = $OlderThanDays }
+            if ($SizeRange)     { $p['SizeRange'] = $SizeRange }
+            if ($HasAttachment) { $p['HasAttachment'] = $true }
+            Invoke-FolderCleanup @p
+        } -Parameters @{
+            Mailbox = $mbx; FolderPath = $folder; Subject = $subj; From = $frm
+            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att
+        } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastFolderCleanup = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
+                Update-StatusBar "Folder estimate: $total item(s) match"
+                try { Write-SearchLog -Action 'FolderEstimate' -Scope $mbx -Result "$total items" } catch {}
+            } catch { Update-StatusBar "Folder estimate error: $_" }
+            $btnFcEstimate.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcEstimate.Enabled = $false
+            Update-StatusBar "Folder estimate error: $err"
+            $btnFcEstimate.Enabled = $true
+        }
+    })
+
+    $btnFcDelete.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        if (-not $mbx) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
+            return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Delete matching messages from $mbx?`nThis action is permanent.`n`nAre you sure?",
+            'Confirm Folder Delete', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { return }
+
+        $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        $subj = $txtFcSubject.Text.Trim()
+        $frm = $txtFcFrom.Text.Trim()
+        $days = [int]$numFcDays.Value
+        $sz = if ($cmbFcSize.SelectedItem -and $cmbFcSize.SelectedItem -ne 'Any') { $cmbFcSize.SelectedItem } else { '' }
+        $att = $chkFcAttach.Checked
+        Update-StatusBar "Deleting messages from $mbx..."
+        $btnFcDelete.Enabled = $false
+
+        Start-AsyncJob -Name "Folder Delete $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment)
+            $p = @{ Mailbox = $Mailbox; Action = 'DeleteContent' }
+            if ($FolderPath)    { $p['FolderPath'] = $FolderPath }
+            if ($Subject)       { $p['Subject'] = $Subject }
+            if ($From)          { $p['From'] = $From }
+            if ($OlderThanDays -gt 0) { $p['OlderThanDays'] = $OlderThanDays }
+            if ($SizeRange)     { $p['SizeRange'] = $SizeRange }
+            if ($HasAttachment) { $p['HasAttachment'] = $true }
+            Invoke-FolderCleanup @p
+        } -Parameters @{
+            Mailbox = $mbx; FolderPath = $folder; Subject = $subj; From = $frm
+            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att
+        } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastFolderCleanup = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
+                Update-StatusBar "Folder delete complete: $total item(s) deleted"
+                try { Write-SearchLog -Action 'FolderDelete' -Scope $mbx -Result "$total items deleted" } catch {}
+                try { Write-OperatorLog -Action 'FolderDelete' -Target $mbx -Details "$total items" } catch {}
+            } catch { Update-StatusBar "Folder delete error: $_" }
+            $btnFcDelete.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcDelete.Enabled = $true
+            Update-StatusBar "Folder delete error: $err"
+        }
+    })
+
+    $btnFcPurge.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        if (-not $mbx) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
+            return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "Purge recoverable/deleted items from $mbx?`nThis permanently removes items from the dumpster.`n`nEstimate first?",
+            'Dumpster Purge', 'YesNoCancel', 'Warning')
+        if ($confirm -eq 'Cancel') { return }
+        $action = if ($confirm -eq 'No') { 'DeleteContent' } else { 'Estimate' }
+
+        Update-StatusBar "Purging dumpster for $mbx ($action)..."
+        $btnFcPurge.Enabled = $false
+
+        Start-AsyncJob -Name "Dumpster $action $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $Action)
+            Invoke-PurgeDeletedItems -Mailbox $Mailbox -Action $Action
+        } -Parameters @{ Mailbox = $mbx; Action = $action } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastFolderCleanup = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
+                Update-StatusBar "Dumpster $action`: $total item(s)"
+                try { Write-SearchLog -Action "DumpsterPurge-$action" -Scope $mbx -Result "$total items" } catch {}
+            } catch { Update-StatusBar "Dumpster error: $_" }
+            $btnFcPurge.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcPurge.Enabled = $true
+            Update-StatusBar "Dumpster error: $err"
+        }
+    })
+
+    $btnFcFindDupes.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        if (-not $mbx) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Duplicates','OK','Warning')
+            return
+        }
+        $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        Update-StatusBar "Scanning for duplicates in $mbx..."
+        $btnFcFindDupes.Enabled = $false
+
+        Start-AsyncJob -Name "FindDupes $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $FolderPath)
+            $p = @{ Mailbox = $Mailbox; DaysBack = 30 }
+            if ($FolderPath) { $p['FolderPath'] = $FolderPath }
+            Find-MailboxDuplicates @p
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastDuplicates = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                $dupeCount = ($data | Where-Object { $_.Status -eq 'PossibleDupes' } | Measure-Object).Count
+                Update-StatusBar "Duplicate scan: $($data.Count) folders, $dupeCount with possible duplicates"
+            } catch { Update-StatusBar "Duplicate scan error: $_" }
+            $btnFcFindDupes.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcFindDupes.Enabled = $true
+            Update-StatusBar "Duplicate scan error: $err"
+        }
+    })
+
+    $btnFcBackupDupes.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        $target = $txtFcTarget.Text.Trim()
+        $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        if (-not $mbx -or -not $folder) {
+            [System.Windows.Forms.MessageBox]::Show('Enter mailbox and select a specific folder.','Duplicates','OK','Warning')
+            return
+        }
+        if (-not $target) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
+            return
+        }
+        Update-StatusBar "Backing up folder $folder from $mbx..."
+        $btnFcBackupDupes.Enabled = $false
+
+        Start-AsyncJob -Name "BackupFolder $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $FolderPath, $TargetMailbox)
+            Remove-FolderDuplicates -Mailbox $Mailbox -FolderPath $FolderPath -TargetMailbox $TargetMailbox -Action 'BackupOnly'
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; TargetMailbox = $target } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastFolderCleanup = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                Update-StatusBar "Folder backup complete"
+                try { Write-OperatorLog -Action 'FolderBackup' -Target $mbx -Details "Folder: $folder -> $target" } catch {}
+            } catch { Update-StatusBar "Backup error: $_" }
+            $btnFcBackupDupes.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcBackupDupes.Enabled = $true
+            Update-StatusBar "Backup error: $err"
+        }
+    })
+
+    $btnFcRemoveDupes.Add_Click({
+        $mbx = $txtFcMailbox.Text.Trim()
+        $target = $txtFcTarget.Text.Trim()
+        $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        if (-not $mbx -or -not $folder) {
+            [System.Windows.Forms.MessageBox]::Show('Enter mailbox and select a specific folder.','Duplicates','OK','Warning')
+            return
+        }
+        if (-not $target) {
+            [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
+            return
+        }
+        $confirm = [System.Windows.Forms.MessageBox]::Show(
+            "This will BACKUP folder content to $target, then DELETE from $mbx.`n`nFolder: $folder`n`nProceed?",
+            'Confirm Backup + Delete', 'YesNo', 'Warning')
+        if ($confirm -ne 'Yes') { return }
+
+        Update-StatusBar "Backup + Delete folder $folder from $mbx..."
+        $btnFcRemoveDupes.Enabled = $false
+
+        Start-AsyncJob -Name "RemoveDupes $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $FolderPath, $TargetMailbox)
+            Remove-FolderDuplicates -Mailbox $Mailbox -FolderPath $FolderPath -TargetMailbox $TargetMailbox -Action 'BackupAndDelete'
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; TargetMailbox = $target } -OnComplete {
+            param($result)
+            try {
+                $data = @($result)
+                $script:LastFolderCleanup = $data
+                Set-DGVData -DGV $dgvFolder -Data $data
+                Update-StatusBar "Backup + Delete complete"
+                try { Write-OperatorLog -Action 'FolderBackupDelete' -Target $mbx -Details "Folder: $folder -> $target" } catch {}
+            } catch { Update-StatusBar "Backup+Delete error: $_" }
+            $btnFcRemoveDupes.Enabled = $true
+        } -OnError {
+            param($err)
+            $btnFcRemoveDupes.Enabled = $true
+            Update-StatusBar "Backup+Delete error: $err"
+        }
+    })
+
+    $btnFcExport.Add_Click({ Show-Export -Data $script:LastFolderCleanup -DefaultName 'folder-cleanup' })
+
     # ─── Assemble tabs ───────────────────────────────────────────────────────
-    $tabs.TabPages.AddRange(@($tabSearch, $tabOrgWide, $tabCompliance, $tabMailboxes, $tabAudit))
+    $tabs.TabPages.AddRange(@($tabSearch, $tabOrgWide, $tabCompliance, $tabMailboxes, $tabFolder, $tabAudit))
     $form.Controls.Add($tabs)
 
     # ─── Connect (async) ─────────────────────────────────────────────────────
@@ -1176,6 +1546,7 @@ function Show-EXRESearcherGUI {
                     $tabCompliance { & $refreshCompliance }
                     $tabMailboxes  { $btnMbxLoad.PerformClick() }
                     $tabAudit      { $btnAuditRefresh.PerformClick() }
+                    $tabFolder     { $btnFcLoadFolders.PerformClick() }
                 }
             }
             if ($e.Control -and $e.KeyCode -eq 'E') {
@@ -1184,6 +1555,7 @@ function Show-EXRESearcherGUI {
                     $tabSearch     { Show-Export -Data $script:LastSearchResults -DefaultName 'search' }
                     $tabOrgWide    { Show-Export -Data $script:LastOrgResults -DefaultName 'org-wide' }
                     $tabMailboxes  { Show-Export -Data $script:LastMailboxList -DefaultName 'mailboxes' }
+                    $tabFolder     { Show-Export -Data $script:LastFolderCleanup -DefaultName 'folder-cleanup' }
                     $tabAudit      { Show-Export -Data $script:LastAuditLog -DefaultName 'audit' }
                 }
             }

@@ -6,8 +6,8 @@ PowerShell GUI for Exchange mailbox content search, eDiscovery, and organization
 
 | Tab | Description |
 |-----|-------------|
-| **Mailbox Search** | Search-Mailbox with KQL filters (subject, from, to, keywords, attachment, date range). Actions: Estimate, Log, Copy to mailbox, Delete |
-| **Org-Wide Delete** | Search and delete messages across ALL mailboxes. Batch processing, double confirmation, safety checks. For phishing/malware cleanup |
+| **Mailbox Search** | Search-Mailbox with KQL filters (subject, from, to, keywords, attachment, date range). Actions: Estimate, Log, Copy to mailbox, Delete. **Double-click** results to preview individual messages via EWS |
+| **Org-Wide Delete** | Search and delete messages across ALL mailboxes. Batch processing, double confirmation, safety checks. **Double-click** to preview messages. For phishing/malware cleanup |
 | **eDiscovery** | In-Place eDiscovery management: create, monitor, stop, remove compliance searches |
 | **Mailboxes** | Browse mailboxes with filters, view statistics, folder breakdown, quick "Use in Search" |
 | **Folder Cleanup** | Folder-level search & delete with filters (age, sender, subject, size, attachments). Dumpster purge. Duplicate detection & backup-and-delete |
@@ -15,23 +15,34 @@ PowerShell GUI for Exchange mailbox content search, eDiscovery, and organization
 
 **Async Architecture** — all Exchange operations run in PowerShell runspaces. GUI never freezes.
 
+**EMS Auto-Detection** — when launched from Exchange Management Shell, automatically discovers servers and connects.
+
 ## Quick Start
 
 ### Requirements
 - Windows PowerShell 5.1+
 - Exchange 2019 SE (Mailbox role)
 - RBAC roles: `Mailbox Search`, `Discovery Management`, `Mailbox Import Export`
+- For message preview: `ApplicationImpersonation` role (EWS)
 
 ### Launch
 ```powershell
+# From Exchange Management Shell (recommended — auto-detects servers)
+.\EXRESearcher.ps1
+
+# Or from regular PowerShell (manual server entry)
 .\EXRESearcher.ps1
 ```
 
-1. Enter Exchange server FQDN → **Connect**
-2. Go to **Mailbox Search** tab
-3. Fill in filters (Subject, From, Date range, etc.)
-4. Enter mailbox(es) in **Scope** field
-5. Click **Estimate** to see how many items match
+**If launched from EMS**: automatically discovers Exchange servers, picks the local one, and connects — ready to use immediately.
+
+**If launched from regular PowerShell**: enter Exchange server FQDN → click **Connect**.
+
+1. Go to **Mailbox Search** tab
+2. Fill in filters (Subject, From, Date range, etc.)
+3. Enter mailbox(es) in **Scope** field
+4. Click **Estimate** to see how many items match
+5. **Double-click** a result row to preview individual messages (Subject, From, To, Date, Size)
 6. Use **Search + Log**, **Copy to Mailbox**, or **Search + Delete**
 
 ### Check Permissions
@@ -198,8 +209,9 @@ EXRESearcher/
 | `Get-MailboxFolderStatistics` | Per-folder breakdown, folder list |
 | `Get-MailboxPermission` | Access rights audit |
 | `Get-ManagementRoleAssignment` | Check RBAC permissions |
-| `Get-ExchangeServer` | Server version info |
+| `Get-ExchangeServer` | Server version info, auto-discovery |
 | `Get-DistributionGroupMember` | Expand groups for search scope |
+| EWS `FindItem` | Message preview (Subject, From, To, Date, Size) |
 
 ## Keyboard Shortcuts
 
@@ -207,8 +219,11 @@ EXRESearcher/
 |-----|--------|
 | **F5** | Refresh current tab |
 | **Ctrl+E** | Export current tab data |
+| **Double-click** | Preview messages in search result row |
 
 ## Version
+
+**1.2.0** — EMS auto-detection and server discovery; connection guard on all operations; EWS message preview on double-click (Subject, From, To, Date, Size); Exchange snap-in loaded in async runspaces; UTF-8 BOM for PowerShell 5.1 compatibility.
 
 **1.1.0** — Folder cleanup tab: folder-level search & delete with filters (age, sender, subject, size, attachments), dumpster purge (recoverable items), duplicate detection, backup-and-delete workflow. Extended KQL with folder, size, hasattachment filters.
 

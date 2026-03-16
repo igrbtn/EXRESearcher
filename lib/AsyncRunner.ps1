@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Async execution framework for EXRESearcher WinForms GUI.
     Uses PowerShell runspaces with form timer polling for thread-safe UI updates.
@@ -39,6 +39,7 @@ function Start-AsyncJob {
     $scriptRoot = $PSScriptRoot
     $initScript = @"
 Set-Location '$($PWD.Path)'
+Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction SilentlyContinue
 . '$scriptRoot/Core.ps1'
 . '$scriptRoot/Settings.ps1'
 "@

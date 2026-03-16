@@ -41,4 +41,4 @@ Invoke-Pester -Path ./tests/
 - `tests/EXRESearcher.Tests.ps1`
 
 ## Versioning
-- Текущая версия: 1.1.0
+- Текущая версия: 1.2.0

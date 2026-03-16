@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Settings, cache, and operator logging for EXRESearcher.
 #>

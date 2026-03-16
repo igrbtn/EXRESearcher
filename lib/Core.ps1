@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Core Exchange content search functions for EXRESearcher.
     Search-Mailbox, ComplianceSearch, mailbox enumeration, bulk operations.
@@ -8,16 +8,65 @@
 # CONNECTION
 # ═══════════════════════════════════════════════════════════════════════════════
 
+function Test-ExchangeManagementShell {
+    <#
+    .SYNOPSIS
+        Check if running inside Exchange Management Shell (EMS).
+        Returns $true if Exchange snap-in/module is already loaded.
+    #>
+    [CmdletBinding()]
+    param()
+
+    # Check for Exchange snap-in (on-prem EMS)
+    $snap = Get-PSSnapin -Name 'Microsoft.Exchange.Management.PowerShell.*' -ErrorAction SilentlyContinue
+    if ($snap) { return $true }
+
+    # Check if key Exchange cmdlets are already available
+    $cmd = Get-Command -Name 'Get-ExchangeServer' -ErrorAction SilentlyContinue
+    if ($cmd) { return $true }
+
+    return $false
+}
+
+function Find-ExchangeServers {
+    <#
+    .SYNOPSIS
+        Auto-discover Exchange servers in the organization.
+        Returns array of server objects with Name, FQDN, Role, Version.
+        Requires EMS or an active Exchange remote session.
+    #>
+    [CmdletBinding()]
+    param()
+
+    $servers = @(Get-ExchangeServer -ErrorAction Stop | Where-Object {
+        $_.ServerRole -match 'Mailbox'
+    } | ForEach-Object {
+        [PSCustomObject]@{
+            Name    = $_.Name
+            FQDN    = $_.Fqdn
+            Role    = "$($_.ServerRole)"
+            Version = "$($_.AdminDisplayVersion)"
+            Site    = "$($_.Site)"
+        }
+    })
+    return $servers
+}
+
 function Connect-ExchangeSearch {
     <#
     .SYNOPSIS
         Connect to Exchange via remote PowerShell (Kerberos).
-        Returns PSSession object.
+        Returns PSSession object or a marker hashtable if EMS is already loaded.
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Server
     )
+
+    # If running inside EMS, cmdlets are already available - no remote session needed
+    if (Test-ExchangeManagementShell) {
+        return @{ IsEMS = $true; Server = $Server }
+    }
 
     $uri = "http://$Server/PowerShell/"
     $session = New-PSSession -ConfigurationName 'Microsoft.Exchange' `
@@ -32,6 +81,8 @@ function Connect-ExchangeSearch {
 function Disconnect-ExchangeSearch {
     [CmdletBinding()]
     param([Parameter(Mandatory)]$Session)
+    # EMS sessions are local - nothing to disconnect
+    if ($Session -is [hashtable] -and $Session.IsEMS) { return }
     try { Remove-PSSession -Session $Session -ErrorAction SilentlyContinue } catch {}
 }
 
@@ -54,6 +105,129 @@ function Get-ExchangeServerVersion {
     } catch {
         return [PSCustomObject]@{ Name = $Server; Edition = 'Unknown'; AdminVersion = 'N/A'; ServerRole = 'N/A'; Site = 'N/A' }
     }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# EWS MESSAGE PREVIEW
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Get-MailboxMessagePreview {
+    <#
+    .SYNOPSIS
+        Retrieve individual messages matching a KQL query via EWS FindItem.
+        Returns array of message objects with Subject, From, To, Received, Size.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$SearchQuery,
+        [string]$Server,
+        [int]$MaxResults = 200
+    )
+
+    if (-not $Server) {
+        $Server = (Get-ExchangeServer | Where-Object { $_.ServerRole -match 'Mailbox' } | Select-Object -First 1).Fqdn
+    }
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+
+    $soap = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:ExchangeImpersonation>
+      <t:ConnectingSID>
+        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
+      </t:ConnectingSID>
+    </t:ExchangeImpersonation>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+    <m:FindItem Traversal="Shallow">
+      <m:ItemShape>
+        <t:BaseShape>Default</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject" />
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+          <t:FieldURI FieldURI="item:Size" />
+          <t:FieldURI FieldURI="message:From" />
+          <t:FieldURI FieldURI="message:ToRecipients" />
+          <t:FieldURI FieldURI="item:HasAttachments" />
+          <t:FieldURI FieldURI="item:ItemClass" />
+          <t:FieldURI FieldURI="item:Importance" />
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:IndexedPageItemView MaxEntriesReturned="$MaxResults" Offset="0" BasePoint="Beginning" />
+      <m:SortOrder>
+        <t:FieldOrder Order="Descending">
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+        </t:FieldOrder>
+      </m:SortOrder>
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="root">
+          <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+      </m:ParentFolderIds>
+      <m:QueryString>$([System.Security.SecurityElement]::Escape($SearchQuery))</m:QueryString>
+    </m:FindItem>
+  </soap:Body>
+</soap:Envelope>
+"@
+
+    # Allow self-signed certs on internal Exchange
+    try {
+        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+    } catch {}
+
+    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+    $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
+                    -UseDefaultCredentials -ErrorAction Stop
+
+    [xml]$xml = $response.Content
+    $ns = @{
+        s  = 'http://schemas.xmlsoap.org/soap/envelope/'
+        m  = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t  = 'http://schemas.microsoft.com/exchange/services/2006/types'
+    }
+
+    $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
+    if (-not $responseMsg -or $responseMsg.ResponseClass -ne 'Success') {
+        $errMsg = if ($responseMsg) { $responseMsg.MessageText } else { 'EWS FindItem failed' }
+        throw $errMsg
+    }
+
+    $items = $xml.SelectNodes('//t:Message', $ns)
+    $results = @()
+
+    foreach ($item in $items) {
+        $fromName = $item.SelectSingleNode('t:From/t:Mailbox/t:Name', $ns)
+        $fromAddr = $item.SelectSingleNode('t:From/t:Mailbox/t:EmailAddress', $ns)
+        $toNodes  = $item.SelectNodes('t:ToRecipients/t:Mailbox', $ns)
+        $toList   = @($toNodes | ForEach-Object {
+            $n = $_.SelectSingleNode('t:Name', $ns)
+            if ($n) { $n.InnerText } else { $_.SelectSingleNode('t:EmailAddress', $ns).InnerText }
+        }) -join '; '
+
+        $sizeBytes = 0
+        $sizeNode = $item.SelectSingleNode('t:Size', $ns)
+        if ($sizeNode) { [int]::TryParse($sizeNode.InnerText, [ref]$sizeBytes) | Out-Null }
+        $sizeKB = [math]::Round($sizeBytes / 1024, 1)
+
+        $results += [PSCustomObject]@{
+            Subject     = $item.SelectSingleNode('t:Subject', $ns).InnerText
+            From        = if ($fromName) { $fromName.InnerText } elseif ($fromAddr) { $fromAddr.InnerText } else { '' }
+            To          = $toList
+            Received    = $item.SelectSingleNode('t:DateTimeReceived', $ns).InnerText
+            SizeKB      = $sizeKB
+            HasAttach   = $item.SelectSingleNode('t:HasAttachments', $ns).InnerText
+            Importance  = $item.SelectSingleNode('t:Importance', $ns).InnerText
+            ItemClass   = $item.SelectSingleNode('t:ItemClass', $ns).InnerText
+        }
+    }
+
+    return $results
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

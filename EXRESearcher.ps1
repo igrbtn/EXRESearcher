@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     EXRESearcher v1.0 — Exchange Content Search & Cleanup GUI.
 .DESCRIPTION
@@ -6,7 +6,7 @@
     and organization-wide message deletion (phishing/malware cleanup).
     All Exchange operations run asynchronously via runspaces.
 .NOTES
-    Version: 1.1.0
+    Version: 1.2.0
     Requires: Exchange 2019 SE, Windows PowerShell 5.1
 #>
 
@@ -183,7 +183,7 @@ function Set-DGVData {
 function Show-EXRESearcherGUI {
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'EXRESearcher v1.1 — Exchange Content Search & Cleanup'
+    $form.Text = 'EXRESearcher v1.2 — Exchange Content Search & Cleanup'
     $form.Size = New-Object System.Drawing.Size(1400, 900)
     $form.MinimumSize = New-Object System.Drawing.Size(1100, 700)
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -366,6 +366,83 @@ function Show-EXRESearcherGUI {
         } catch {}
     })
 
+    # --- Double-click: preview found messages via EWS ---
+    $dgvSearchResults.Add_CellDoubleClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        $mbx = "$($row.Cells['Mailbox'].Value)"
+        $query = "$($row.Cells['SearchQuery'].Value)"
+        $count = "$($row.Cells['ResultItems'].Value)"
+        if (-not $mbx -or -not $query -or $count -eq '0') { return }
+
+        $serverFqdn = $txtServer.Text.Trim()
+        Update-StatusBar "Loading message preview for $mbx..."
+
+        Start-AsyncJob -Name "Preview $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $SearchQuery, $Server)
+            return @(Get-MailboxMessagePreview -Mailbox $Mailbox -SearchQuery $SearchQuery -Server $Server -MaxResults 200)
+        } -Parameters @{ Mailbox = $mbx; SearchQuery = $query; Server = $serverFqdn } -OnComplete {
+            param($result)
+            try {
+                $messages = @($result)
+                if ($messages.Count -eq 0) {
+                    Update-StatusBar "No messages returned from EWS preview"
+                    return
+                }
+
+                # Build preview dialog
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Message Preview: $mbx ($($messages.Count) messages)"
+                $dlg.Size = New-Object System.Drawing.Size(1100, 600)
+                $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+                $dlg.StartPosition = 'CenterParent'
+                $dlg.MinimumSize = New-Object System.Drawing.Size(800, 400)
+
+                $grid = New-StyledDGV -Multi
+                $grid.Dock = 'Fill'
+                Set-DGVData -DGV $grid -Data $messages
+
+                # Resize columns
+                foreach ($col in $grid.Columns) {
+                    switch ($col.Name) {
+                        'Subject'   { $col.Width = 350 }
+                        'From'      { $col.Width = 180 }
+                        'To'        { $col.Width = 180 }
+                        'Received'  { $col.Width = 150 }
+                        'SizeKB'    { $col.Width = 70; $col.HeaderText = 'Size (KB)' }
+                        'HasAttach' { $col.Width = 50; $col.HeaderText = 'Attach' }
+                        'Importance'{ $col.Width = 70 }
+                        'ItemClass' { $col.Width = 120; $col.HeaderText = 'Type' }
+                    }
+                }
+
+                $bottomBar = New-FlowBar -H 38
+                $bottomBar.Dock = 'Bottom'
+                $btnExportPreview = New-Btn -Text 'Export...' -W 80
+                $lblPreviewCount = New-InlineLabel -Text "$($messages.Count) messages" -MarginLeft 10
+                $btnExportPreview.Add_Click({ Show-Export -Data $messages -DefaultName 'message-preview' })
+                $bottomBar.Controls.AddRange(@($btnExportPreview, $lblPreviewCount))
+
+                $dlg.Controls.Add($grid)
+                $dlg.Controls.Add($bottomBar)
+                $grid.BringToFront()
+
+                Update-StatusBar "Preview loaded: $($messages.Count) messages in $mbx"
+                [void]$dlg.ShowDialog($form)
+                $dlg.Dispose()
+            } catch {
+                Update-StatusBar "Preview display error: $_"
+            }
+        } -OnError {
+            param($err)
+            Update-StatusBar "Preview error: $err"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not load message preview:`n$err`n`nNote: EWS impersonation rights may be required.",
+                'Preview Error', 'OK', 'Warning')
+        }
+    })
+
     $searchBottom = New-FlowBar -H 38
     $searchBottom.Dock = 'Bottom'
     $btnSearchExport = New-Btn -Text 'Export...' -W 80
@@ -413,9 +490,21 @@ function Show-EXRESearcherGUI {
         return @($scopeText -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
 
+    # --- Connection guard ---
+    $requireConnection = {
+        if (-not $script:Session) {
+            [System.Windows.Forms.MessageBox]::Show(
+                'Connect to an Exchange server first.',
+                'Not Connected', 'OK', 'Warning')
+            return $false
+        }
+        return $true
+    }
+
     # --- Search actions ---
     $doSearch = {
         param([string]$Action)
+        if (-not (& $requireConnection)) { return }
         $query = & $buildCurrentQuery
         $mailboxes = & $getMailboxScope
         if ($mailboxes.Count -eq 0) {
@@ -486,6 +575,7 @@ function Show-EXRESearcherGUI {
     $btnSearchExport.Add_Click({ Show-Export -Data $script:LastSearchResults -DefaultName 'search-results' })
 
     $btnCheckPerms.Add_Click({
+        if (-not (& $requireConnection)) { return }
         Update-StatusBar 'Checking permissions...'
         Start-AsyncJob -Name 'CheckPermissions' -Form $form -ScriptBlock {
             $perms = Test-SearchPermissions
@@ -601,6 +691,79 @@ function Show-EXRESearcherGUI {
             }
         } catch {}
     })
+    # --- Double-click: preview messages in org-wide results ---
+    $dgvOrgResults.Add_CellDoubleClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        $row = $s.Rows[$e.RowIndex]
+        $mbx = "$($row.Cells['Mailbox'].Value)"
+        $query = "$($row.Cells['SearchQuery'].Value)"
+        $count = "$($row.Cells['ResultItems'].Value)"
+        if (-not $mbx -or -not $query -or $count -eq '0') { return }
+
+        $serverFqdn = $txtServer.Text.Trim()
+        Update-StatusBar "Loading message preview for $mbx..."
+
+        Start-AsyncJob -Name "Preview $mbx" -Form $form -ScriptBlock {
+            param($Mailbox, $SearchQuery, $Server)
+            return @(Get-MailboxMessagePreview -Mailbox $Mailbox -SearchQuery $SearchQuery -Server $Server -MaxResults 200)
+        } -Parameters @{ Mailbox = $mbx; SearchQuery = $query; Server = $serverFqdn } -OnComplete {
+            param($result)
+            try {
+                $messages = @($result)
+                if ($messages.Count -eq 0) {
+                    Update-StatusBar "No messages returned from EWS preview"
+                    return
+                }
+
+                $dlg = New-Object System.Windows.Forms.Form
+                $dlg.Text = "Message Preview: $mbx ($($messages.Count) messages)"
+                $dlg.Size = New-Object System.Drawing.Size(1100, 600)
+                $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+                $dlg.StartPosition = 'CenterParent'
+                $dlg.MinimumSize = New-Object System.Drawing.Size(800, 400)
+
+                $grid = New-StyledDGV -Multi
+                $grid.Dock = 'Fill'
+                Set-DGVData -DGV $grid -Data $messages
+                foreach ($col in $grid.Columns) {
+                    switch ($col.Name) {
+                        'Subject'   { $col.Width = 350 }
+                        'From'      { $col.Width = 180 }
+                        'To'        { $col.Width = 180 }
+                        'Received'  { $col.Width = 150 }
+                        'SizeKB'    { $col.Width = 70; $col.HeaderText = 'Size (KB)' }
+                        'HasAttach' { $col.Width = 50; $col.HeaderText = 'Attach' }
+                        'Importance'{ $col.Width = 70 }
+                        'ItemClass' { $col.Width = 120; $col.HeaderText = 'Type' }
+                    }
+                }
+
+                $bottomBar = New-FlowBar -H 38
+                $bottomBar.Dock = 'Bottom'
+                $btnExportPreview = New-Btn -Text 'Export...' -W 80
+                $lblPreviewCount = New-InlineLabel -Text "$($messages.Count) messages" -MarginLeft 10
+                $btnExportPreview.Add_Click({ Show-Export -Data $messages -DefaultName 'message-preview' })
+                $bottomBar.Controls.AddRange(@($btnExportPreview, $lblPreviewCount))
+
+                $dlg.Controls.Add($grid)
+                $dlg.Controls.Add($bottomBar)
+                $grid.BringToFront()
+
+                Update-StatusBar "Preview: $($messages.Count) messages in $mbx"
+                [void]$dlg.ShowDialog($form)
+                $dlg.Dispose()
+            } catch {
+                Update-StatusBar "Preview display error: $_"
+            }
+        } -OnError {
+            param($err)
+            Update-StatusBar "Preview error: $err"
+            [System.Windows.Forms.MessageBox]::Show(
+                "Could not load message preview:`n$err`n`nNote: EWS impersonation rights may be required.",
+                'Preview Error', 'OK', 'Warning')
+        }
+    })
     $orgSplit.Panel2.Controls.Add($dgvOrgResults)
 
     $orgBottom = New-FlowBar -H 38
@@ -633,6 +796,7 @@ function Show-EXRESearcherGUI {
 
     $doOrgSearch = {
         param([switch]$Delete)
+        if (-not (& $requireConnection)) { return }
         $query = & $buildOrgQuery
         if ($query -eq '*') {
             [System.Windows.Forms.MessageBox]::Show('Wildcard search on all mailboxes is not allowed. Add filters.','Safety Check','OK','Error')
@@ -778,6 +942,7 @@ function Show-EXRESearcherGUI {
 
     # --- Compliance actions ---
     $refreshCompliance = {
+        if (-not (& $requireConnection)) { return }
         Update-StatusBar 'Loading eDiscovery searches...'
         Start-AsyncJob -Name 'eDiscovery List' -Form $form -ScriptBlock {
             return @(Get-ContentSearches)
@@ -798,6 +963,7 @@ function Show-EXRESearcherGUI {
     $btnCompRefresh.Add_Click($refreshCompliance)
 
     $btnCompCreate.Add_Click({
+        if (-not (& $requireConnection)) { return }
         try {
             $name = $txtCompName.Text.Trim()
             $query = $txtCompQuery.Text.Trim()
@@ -959,6 +1125,7 @@ function Show-EXRESearcherGUI {
     $tabMailboxes.Controls.Add($mbxPanel)
 
     $btnMbxLoad.Add_Click({
+        if (-not (& $requireConnection)) { return }
         Update-StatusBar 'Loading mailboxes...'
         $filterVal = $txtMbxFilter.Text
         $typeVal = $cmbMbxType.SelectedItem.ToString()
@@ -1193,6 +1360,7 @@ function Show-EXRESearcherGUI {
 
     # --- Folder Cleanup Events ---
     $btnFcLoadFolders.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         if (-not $mbx) {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
@@ -1225,6 +1393,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcEstimate.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         if (-not $mbx) {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
@@ -1272,6 +1441,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcDelete.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         if (-not $mbx) {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
@@ -1324,6 +1494,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcPurge.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         if (-not $mbx) {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
@@ -1360,6 +1531,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcFindDupes.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         if (-not $mbx) {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Duplicates','OK','Warning')
@@ -1392,6 +1564,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcBackupDupes.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         $target = $txtFcTarget.Text.Trim()
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
@@ -1427,6 +1600,7 @@ function Show-EXRESearcherGUI {
     })
 
     $btnFcRemoveDupes.Add_Click({
+        if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
         $target = $txtFcTarget.Text.Trim()
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
@@ -1471,6 +1645,7 @@ function Show-EXRESearcherGUI {
     # ─── Assemble tabs ───────────────────────────────────────────────────────
     $tabs.TabPages.AddRange(@($tabSearch, $tabOrgWide, $tabCompliance, $tabMailboxes, $tabFolder, $tabAudit))
     $form.Controls.Add($tabs)
+    $tabs.BringToFront()
 
     # ─── Connect (async) ─────────────────────────────────────────────────────
     $btnConnect.Add_Click({
@@ -1586,6 +1761,43 @@ function Show-EXRESearcherGUI {
 
         if ($script:Session) {
             try { Disconnect-ExchangeSearch -Session $script:Session } catch {}
+        }
+    })
+
+    # ─── Auto-detect EMS and connect ─────────────────────────────────────────
+    $form.Add_Shown({
+        try {
+            if (Test-ExchangeManagementShell) {
+                Update-StatusBar 'Exchange Management Shell detected. Discovering servers...'
+                $lblConnStatus.Text = 'EMS detected...'
+                $lblConnStatus.ForeColor = [System.Drawing.Color]::FromArgb(200,150,0)
+                $form.Refresh()
+
+                $servers = @(Find-ExchangeServers)
+                if ($servers.Count -gt 0) {
+                    # Pick local server if possible, otherwise first one
+                    $localName = $env:COMPUTERNAME
+                    $local = $servers | Where-Object { $_.Name -eq $localName } | Select-Object -First 1
+                    $picked = if ($local) { $local } else { $servers[0] }
+
+                    $txtServer.Text = $picked.FQDN
+                    $autoComplete.Clear()
+                    foreach ($s in $servers) { [void]$autoComplete.Add($s.FQDN) }
+
+                    # Auto-connect (EMS - no remote session needed)
+                    $script:Session = @{ IsEMS = $true; Server = $picked.FQDN }
+                    $ver = Get-ExchangeServerVersion -Server $picked.Name
+                    $lblConnStatus.Text = "EMS: $($picked.Name) ($($ver.AdminVersion))"
+                    $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
+                    $btnDisconnect.Visible = $true
+                    try { Write-OperatorLog -Action 'AutoConnect-EMS' -Target $picked.Name } catch {}
+                    Update-StatusBar "Auto-connected via EMS - $($picked.Name) ($($ver.Edition) $($ver.AdminVersion)) | $($servers.Count) server(s) found"
+                } else {
+                    Update-StatusBar 'EMS detected but no Mailbox servers found'
+                }
+            }
+        } catch {
+            Update-StatusBar "EMS auto-detect: $_"
         }
     })
 

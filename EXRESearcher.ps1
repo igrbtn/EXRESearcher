@@ -6,7 +6,7 @@
     and organization-wide message deletion (phishing/malware cleanup).
     All Exchange operations run asynchronously via runspaces.
 .NOTES
-    Version: 1.2.0
+    Version: 1.3.0
     Requires: Exchange 2019 SE, Windows PowerShell 5.1
 #>
 
@@ -183,7 +183,7 @@ function Set-DGVData {
 function Show-EXRESearcherGUI {
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'EXRESearcher v1.2 — Exchange Content Search & Cleanup'
+    $form.Text = 'EXRESearcher v1.3 — Exchange Content Search & Cleanup'
     $form.Size = New-Object System.Drawing.Size(1400, 900)
     $form.MinimumSize = New-Object System.Drawing.Size(1100, 700)
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)

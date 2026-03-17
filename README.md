@@ -223,6 +223,8 @@ EXRESearcher/
 
 ## Version
 
+**1.3.0** — Safe Mode (Show commands) with WhatIf button on all operations; delete confirmation dialog with data loss checkbox and WhatIf; EWS folder-scoped search (replaces unsupported folder: KQL keyword); linked Folder dropdown and grid; folder required for delete; EWS auto-fallback (own mailbox / Full Access / impersonation).
+
 **1.2.0** — EMS auto-detection and server discovery; connection guard on all operations; EWS message preview on double-click (Subject, From, To, Date, Size); Exchange snap-in loaded in async runspaces; UTF-8 BOM for PowerShell 5.1 compatibility.
 
 **1.1.0** — Folder cleanup tab: folder-level search & delete with filters (age, sender, subject, size, attachments), dumpster purge (recoverable items), duplicate detection, backup-and-delete workflow. Extended KQL with folder, size, hasattachment filters.

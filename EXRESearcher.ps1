@@ -1536,6 +1536,42 @@ function Show-EXRESearcherGUI {
         } catch {}
     })
 
+    # --- Grid click -> sync Folder dropdown ---
+    $dgvFolder.Add_CellClick({
+        param($s, $e)
+        if ($e.RowIndex -lt 0) { return }
+        try {
+            $fpCol = $null
+            foreach ($c in $s.Columns) { if ($c.Name -eq 'FolderPath') { $fpCol = $c.Index; break } }
+            if ($null -eq $fpCol) { return }
+            $folderPath = "$($s.Rows[$e.RowIndex].Cells[$fpCol].Value)"
+            if ($folderPath -and $cmbFcFolder.Items.Contains($folderPath)) {
+                $cmbFcFolder.SelectedItem = $folderPath
+            }
+        } catch {}
+    })
+
+    # --- Folder dropdown -> highlight grid row ---
+    $cmbFcFolder.Add_SelectedIndexChanged({
+        try {
+            $selected = $cmbFcFolder.SelectedItem
+            if (-not $selected -or $selected -eq '(All Folders)') {
+                $dgvFolder.ClearSelection()
+                return
+            }
+            foreach ($row in $dgvFolder.Rows) {
+                $fpCol = $null
+                foreach ($c in $dgvFolder.Columns) { if ($c.Name -eq 'FolderPath') { $fpCol = $c.Index; break } }
+                if ($null -ne $fpCol -and "$($row.Cells[$fpCol].Value)" -eq $selected) {
+                    $dgvFolder.ClearSelection()
+                    $row.Selected = $true
+                    $dgvFolder.FirstDisplayedScrollingRowIndex = $row.Index
+                    break
+                }
+            }
+        } catch {}
+    })
+
     $folderPanel.Controls.Add($dgvFolder)
     $folderPanel.Controls.Add($folderBar3)
     $folderPanel.Controls.Add($folderBar2)
@@ -1663,13 +1699,19 @@ function Show-EXRESearcherGUI {
             return
         }
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        if (-not $folder) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "Select a specific folder to delete from.`n`nDeleting from (All Folders) is not allowed here.`nUse the Mailbox Search tab for org-wide operations.",
+                'Folder Required', 'OK', 'Warning')
+            return
+        }
         $subj = $txtFcSubject.Text.Trim()
         $frm = $txtFcFrom.Text.Trim()
         $days = [int]$numFcDays.Value
         $sz = if ($cmbFcSize.SelectedItem -and $cmbFcSize.SelectedItem -ne 'Any') { $cmbFcSize.SelectedItem } else { '' }
         $att = $chkFcAttach.Checked
         $cmdText = & $buildFcCommand -Mbx $mbx -Folder $folder -Subj $subj -Frm $frm -Days $days -Sz $sz -Att $att -Action 'Delete'
-        $folderInfo = if ($folder) { " from folder `"$folder`"" } else { '' }
+        $folderInfo = " from folder `"$folder`""
         $result = & $confirmDelete -Message "Delete matching messages from $mbx$folderInfo?`nThis action is permanent!" -CommandText $cmdText
         if ($result -ne 'OK') { return }
         Update-StatusBar "Deleting messages from $mbx..."

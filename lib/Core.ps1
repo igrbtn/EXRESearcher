@@ -284,7 +284,6 @@ function Get-MailboxMessagePreview {
 
     $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
     $ns = New-EwsNamespaceManager -Xml $xml
-    $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
 
     $items = $xml.SelectNodes('//t:Message', $ns)
     $results = @()
@@ -295,7 +294,8 @@ function Get-MailboxMessagePreview {
         $toNodes  = $item.SelectNodes('t:ToRecipients/t:Mailbox', $ns)
         $toList   = @($toNodes | ForEach-Object {
             $n = $_.SelectSingleNode('t:Name', $ns)
-            if ($n) { $n.InnerText } else { $_.SelectSingleNode('t:EmailAddress', $ns).InnerText }
+            $e = $_.SelectSingleNode('t:EmailAddress', $ns)
+            if ($n) { $n.InnerText } elseif ($e) { $e.InnerText } else { '' }
         }) -join '; '
 
         $sizeBytes = 0
@@ -303,15 +303,21 @@ function Get-MailboxMessagePreview {
         if ($sizeNode) { [int]::TryParse($sizeNode.InnerText, [ref]$sizeBytes) | Out-Null }
         $sizeKB = [math]::Round($sizeBytes / 1024, 1)
 
+        $subjectNode  = $item.SelectSingleNode('t:Subject', $ns)
+        $receivedNode = $item.SelectSingleNode('t:DateTimeReceived', $ns)
+        $attachNode   = $item.SelectSingleNode('t:HasAttachments', $ns)
+        $importNode   = $item.SelectSingleNode('t:Importance', $ns)
+        $classNode    = $item.SelectSingleNode('t:ItemClass', $ns)
+
         $results += [PSCustomObject]@{
-            Subject     = $item.SelectSingleNode('t:Subject', $ns).InnerText
+            Subject     = if ($subjectNode)  { $subjectNode.InnerText }  else { '(no subject)' }
             From        = if ($fromName) { $fromName.InnerText } elseif ($fromAddr) { $fromAddr.InnerText } else { '' }
             To          = $toList
-            Received    = $item.SelectSingleNode('t:DateTimeReceived', $ns).InnerText
+            Received    = if ($receivedNode) { $receivedNode.InnerText } else { '' }
             SizeKB      = $sizeKB
-            HasAttach   = $item.SelectSingleNode('t:HasAttachments', $ns).InnerText
-            Importance  = $item.SelectSingleNode('t:Importance', $ns).InnerText
-            ItemClass   = $item.SelectSingleNode('t:ItemClass', $ns).InnerText
+            HasAttach   = if ($attachNode)   { $attachNode.InnerText }   else { 'false' }
+            Importance  = if ($importNode)   { $importNode.InnerText }   else { 'Normal' }
+            ItemClass   = if ($classNode)    { $classNode.InnerText }    else { 'IPM.Note' }
         }
     }
 
@@ -490,16 +496,21 @@ function Find-MessageByMessageId {
     }
 
     if ($Action -eq 'DeleteContent' -and $itemIds.Count -gt 0) {
-        $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+        $deleted = 0
         foreach ($itemRef in $itemIds) {
-            $deleteBody = @"
+            try {
+                $deleteBody = @"
     <m:DeleteItem DeleteType="SoftDelete" AffectedTaskOccurrences="AllOccurrences">
       <m:ItemIds>
         <t:ItemId Id="$($itemRef.Id)" ChangeKey="$($itemRef.ChangeKey)" />
       </m:ItemIds>
     </m:DeleteItem>
 "@
-            $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+                $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+                $deleted++
+            } catch {
+                Write-Warning "Failed to delete item: $_"
+            }
         }
     }
 
@@ -1186,14 +1197,18 @@ function Invoke-FolderCleanupEWS {
                 "<t:ItemId Id=`"$($_.Id)`" ChangeKey=`"$($_.ChangeKey)`" />"
             }) -join "`n"
 
-            $deleteBody = @"
+            try {
+                $deleteBody = @"
     <m:DeleteItem DeleteType="SoftDelete" AffectedTaskOccurrences="AllOccurrences">
       <m:ItemIds>
         $itemIdXml
       </m:ItemIds>
     </m:DeleteItem>
 "@
-            $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+                $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+            } catch {
+                Write-Warning "Batch delete failed: $_"
+            }
         }
     }
 
@@ -1231,6 +1246,8 @@ function Find-EwsFolderId {
 
     # Split path and walk from msgfolderroot
     $pathParts = $FolderPath.Split('/\', [System.StringSplitOptions]::RemoveEmptyEntries)
+    if ($pathParts.Count -eq 0) { return $null }
+    $match = $null
     $currentParent = @"
         <t:DistinguishedFolderId Id="msgfolderroot">
           <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
@@ -1262,7 +1279,8 @@ function Find-EwsFolderId {
         $currentParent = "<t:FolderId Id=`"$($match.GetAttribute('Id'))`" />"
     }
 
-    return $match.GetAttribute('Id')
+    if ($match) { return $match.GetAttribute('Id') }
+    return $null
 }
 
 function Invoke-PurgeDeletedItems {

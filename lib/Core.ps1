@@ -111,6 +111,16 @@ function Get-ExchangeServerVersion {
 # EWS HELPERS
 # ═══════════════════════════════════════════════════════════════════════════════
 
+function New-EwsNamespaceManager {
+    <# Create XmlNamespaceManager for EWS SOAP responses #>
+    param([System.Xml.XmlDocument]$Xml)
+    $nsMgr = New-Object System.Xml.XmlNamespaceManager($Xml.NameTable)
+    $nsMgr.AddNamespace('s', 'http://schemas.xmlsoap.org/soap/envelope/')
+    $nsMgr.AddNamespace('m', 'http://schemas.microsoft.com/exchange/services/2006/messages')
+    $nsMgr.AddNamespace('t', 'http://schemas.microsoft.com/exchange/services/2006/types')
+    return $nsMgr
+}
+
 function Invoke-EwsRequest {
     <#
     .SYNOPSIS
@@ -164,11 +174,6 @@ $SoapBody
 </soap:Envelope>
 "@
 
-    $ns = @{
-        s = 'http://schemas.xmlsoap.org/soap/envelope/'
-        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
     # Also build a variant without Mailbox element (for own mailbox access)
     $soapBodyNoMbx = $SoapBody -replace '<t:Mailbox>\s*<t:EmailAddress>[^<]*</t:EmailAddress>\s*</t:Mailbox>', ''
     $soap0 = @"
@@ -193,13 +198,14 @@ $soapBodyNoMbx
             $response = Invoke-WebRequest -Uri $EwsUrl -Method POST -Body $soap -Headers $headers `
                             -UseDefaultCredentials -ErrorAction Stop
             [xml]$xml = $response.Content
+            $nsMgr = New-EwsNamespaceManager -Xml $xml
 
             # Check for SOAP fault
-            $fault = $xml.SelectSingleNode('//s:Fault/faultstring', $ns)
+            $fault = $xml.SelectSingleNode('//s:Fault/faultstring', $nsMgr)
             if ($fault) { $lastError = $fault.InnerText; continue }
 
             # Check for error response
-            $respMsg = $xml.SelectNodes('//*[@ResponseClass]', $ns)
+            $respMsg = $xml.SelectNodes('//*[@ResponseClass]', $nsMgr)
             $hasError = $false
             foreach ($r in $respMsg) {
                 if ($r.ResponseClass -eq 'Error') {
@@ -277,10 +283,7 @@ function Get-MailboxMessagePreview {
 "@
 
     $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
-    $ns = @{
-        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
+    $ns = New-EwsNamespaceManager -Xml $xml
     $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
 
     $items = $xml.SelectNodes('//t:Message', $ns)
@@ -468,10 +471,7 @@ function Find-MessageByMessageId {
 "@
 
     $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
-    $ns = @{
-        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
+    $ns = New-EwsNamespaceManager -Xml $xml
 
     $items = $xml.SelectNodes('//t:Message', $ns)
     $totalSize = 0
@@ -1153,10 +1153,7 @@ function Invoke-FolderCleanupEWS {
 "@
 
     $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
-    $ns = @{
-        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
+    $ns = New-EwsNamespaceManager -Xml $xml
 
     $totalCount = 0
     $rootFolder = $xml.SelectSingleNode('//m:RootFolder', $ns)
@@ -1231,10 +1228,6 @@ function Find-EwsFolderId {
     )
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
-    $ns = @{
-        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
 
     # Split path and walk from msgfolderroot
     $pathParts = $FolderPath.Split('/\', [System.StringSplitOptions]::RemoveEmptyEntries)
@@ -1254,6 +1247,7 @@ function Find-EwsFolderId {
     </m:FindFolder>
 "@
         $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $findFolderBody -Mailbox $Mailbox
+        $ns = New-EwsNamespaceManager -Xml $xml
 
         $folders = $xml.SelectNodes('//t:Folder', $ns)
         $match = $null

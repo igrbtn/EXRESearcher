@@ -685,6 +685,7 @@ function Show-EXRESearcherGUI {
         $btnCancel = New-Btn -Text 'Cancel' -W 90
         $btnOK = New-Btn -Text 'Delete' -W 90 -Color 'Red'
         $btnOK.Enabled = $false
+        $btnWhatIf2 = New-Btn -Text 'WhatIf' -W 90 -Color 'Orange'
         $btnScript = New-Btn -Text 'Show Script' -W 100 -Color 'Blue'
 
         $script:deleteDialogResult = 'Cancel'
@@ -694,8 +695,52 @@ function Show-EXRESearcherGUI {
         $btnScript.Add_Click({
             $script:deleteDialogResult = 'ShowScript'; $dlg.Close()
         })
+        $btnWhatIf2.Add_Click({
+            try {
+                $lines = $CommandText -split "`r?`n"
+                $whatIfCmd = @()
+                foreach ($line in $lines) {
+                    $l = $line.Trim()
+                    if (-not $l -or $l.StartsWith('#')) { continue }
+                    if ($l -notmatch '-WhatIf') { $l += ' -WhatIf' }
+                    $whatIfCmd += $l
+                }
+                if ($whatIfCmd.Count -eq 0) { return }
+                $script2 = $whatIfCmd -join "`r`n"
+                $btnWhatIf2.Enabled = $false
+                $btnWhatIf2.Text = 'Running...'
+                $dlg.Refresh()
+                $output = try {
+                    $sb = [scriptblock]::Create($script2)
+                    & $sb 2>&1 | Out-String
+                } catch { "Error: $_" }
+                $resDlg = New-Object System.Windows.Forms.Form
+                $resDlg.Text = 'WhatIf Results'
+                $resDlg.Size = New-Object System.Drawing.Size(700, 400)
+                $resDlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+                $resDlg.StartPosition = 'CenterParent'
+                $resTxt = New-Object System.Windows.Forms.TextBox
+                $resTxt.Multiline = $true; $resTxt.ScrollBars = 'Both'; $resTxt.WordWrap = $false
+                $resTxt.Font = New-Object System.Drawing.Font('Consolas', 10)
+                $resTxt.Dock = 'Fill'; $resTxt.ReadOnly = $true
+                $resTxt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+                $resTxt.ForeColor = [System.Drawing.Color]::FromArgb(180,220,180)
+                $resTxt.Text = "# Command:`r`n$script2`r`n`r`n# Output:`r`n$output"
+                $resClose = New-Btn -Text 'Close' -W 90
+                $resClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $resBar = New-Object System.Windows.Forms.FlowLayoutPanel
+                $resBar.Dock = 'Bottom'; $resBar.Height = 44
+                $resBar.FlowDirection = 'RightToLeft'
+                $resBar.Padding = New-Object System.Windows.Forms.Padding(6)
+                $resBar.Controls.Add($resClose)
+                $resDlg.Controls.Add($resTxt); $resDlg.Controls.Add($resBar); $resTxt.BringToFront()
+                [void]$resDlg.ShowDialog($dlg); $resDlg.Dispose()
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show("WhatIf error: $_", 'Error', 'OK', 'Error')
+            } finally { $btnWhatIf2.Enabled = $true; $btnWhatIf2.Text = 'WhatIf' }
+        })
 
-        $btnBar.Controls.AddRange(@($btnCancel, $btnOK, $btnScript))
+        $btnBar.Controls.AddRange(@($btnCancel, $btnOK, $btnWhatIf2, $btnScript))
         $dlg.Controls.AddRange(@($iconBox, $lbl, $chkConfirm, $btnBar))
 
         [void]$dlg.ShowDialog($form)
@@ -729,8 +774,9 @@ function Show-EXRESearcherGUI {
         # Build command string for preview
         $mbxList = $mailboxes -join ', '
         $cmdLines = @()
+        $queryEscaped = $query -replace '"', '`"'
         foreach ($m in $mailboxes) {
-            $cmd = "Search-Mailbox -Identity `"$m`" -SearchQuery `"$query`""
+            $cmd = "Search-Mailbox -Identity `"$m`" -SearchQuery `"$queryEscaped`""
             switch ($Action) {
                 'Estimate'      { $cmd += " -EstimateResultOnly" }
                 'LogOnly'       { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`" -LogOnly" }
@@ -1036,7 +1082,8 @@ function Show-EXRESearcherGUI {
         }
 
         $batchSize = [int]$nudOrgBatch.Value
-        $cmdText = "Get-Mailbox -ResultSize Unlimited | Search-Mailbox -SearchQuery `"$query`""
+        $queryEsc = $query -replace '"', '`"'
+        $cmdText = "Get-Mailbox -ResultSize Unlimited | Search-Mailbox -SearchQuery `"$queryEsc`""
         if ($Delete) {
             $cmdText += " -DeleteContent -Force"
         } else {
@@ -1215,7 +1262,8 @@ function Show-EXRESearcherGUI {
                 $mbxList = @($txtCompMailboxes.Text -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             }
             $estimateOnly = $chkCompEstimate.Checked
-            $cmdText = "New-MailboxSearch -Name `"$name`" -SearchQuery `"$query`""
+            $queryEsc = $query -replace '"', '`"'
+            $cmdText = "New-MailboxSearch -Name `"$name`" -SearchQuery `"$queryEsc`""
             if ($allMbx) { $cmdText += " -AllMailboxes" }
             elseif ($mbxList.Count -gt 0) { $cmdText += " -SourceMailboxes `"$($mbxList -join '","')`"" }
             if ($estimateOnly) { $cmdText += " -EstimateOnly" }
@@ -1696,7 +1744,8 @@ function Show-EXRESearcherGUI {
             if ($Sz) { $cmd += "# Size filter: $Sz`r`n" }
             $cmd += "# Equivalent Search-Mailbox (all folders):`r`n"
         } else { $cmd = '' }
-        $cmd += "Search-Mailbox -Identity `"$Mbx`" -SearchQuery `"$q`""
+        $qEsc = $q -replace '"', '`"'
+        $cmd += "Search-Mailbox -Identity `"$Mbx`" -SearchQuery `"$qEsc`""
         if ($Action -eq 'Estimate') { $cmd += " -EstimateResultOnly" }
         else { $cmd += " -DeleteContent -Force" }
         return $cmd

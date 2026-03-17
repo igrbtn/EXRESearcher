@@ -169,10 +169,26 @@ $SoapBody
         m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
         t = 'http://schemas.microsoft.com/exchange/services/2006/types'
     }
+    # Also build a variant without Mailbox element (for own mailbox access)
+    $soapBodyNoMbx = $SoapBody -replace '<t:Mailbox>\s*<t:EmailAddress>[^<]*</t:EmailAddress>\s*</t:Mailbox>', ''
+    $soap0 = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+$soapBodyNoMbx
+  </soap:Body>
+</soap:Envelope>
+"@
+
     $lastError = ''
 
-    # Try without impersonation first
-    foreach ($soap in @($soap1, $soap2)) {
+    # Try: 1) own mailbox, 2) with Mailbox element (Full Access), 3) with impersonation
+    foreach ($soap in @($soap0, $soap1, $soap2)) {
         try {
             $response = Invoke-WebRequest -Uri $EwsUrl -Method POST -Body $soap -Headers $headers `
                             -UseDefaultCredentials -ErrorAction Stop

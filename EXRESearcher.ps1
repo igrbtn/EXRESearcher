@@ -225,6 +225,7 @@ function Show-EXRESearcherGUI {
     $chkSafeMode = New-Object System.Windows.Forms.CheckBox
     $chkSafeMode.Text = 'Safe Mode (Show commands)'
     $chkSafeMode.AutoSize = $true
+    $chkSafeMode.Checked = $true
     $chkSafeMode.Margin = New-Object System.Windows.Forms.Padding(20,8,3,4)
     $chkSafeMode.ForeColor = [System.Drawing.Color]::FromArgb(100,100,100)
 

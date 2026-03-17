@@ -108,6 +108,102 @@ function Get-ExchangeServerVersion {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# EWS HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Invoke-EwsRequest {
+    <#
+    .SYNOPSIS
+        Send EWS SOAP request. Tries without impersonation first, then with.
+        Returns [xml] response.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$EwsUrl,
+        [Parameter(Mandatory)][string]$SoapBody,
+        [string]$Mailbox
+    )
+
+    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
+    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+
+    $escapedMailbox = if ($Mailbox) { [System.Security.SecurityElement]::Escape($Mailbox) } else { '' }
+
+    # SOAP without impersonation
+    $soap1 = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+$SoapBody
+  </soap:Body>
+</soap:Envelope>
+"@
+
+    # SOAP with impersonation
+    $soap2 = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:ExchangeImpersonation>
+      <t:ConnectingSID>
+        <t:SmtpAddress>$escapedMailbox</t:SmtpAddress>
+      </t:ConnectingSID>
+    </t:ExchangeImpersonation>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+$SoapBody
+  </soap:Body>
+</soap:Envelope>
+"@
+
+    $ns = @{
+        s = 'http://schemas.xmlsoap.org/soap/envelope/'
+        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
+    }
+    $lastError = ''
+
+    # Try without impersonation first
+    foreach ($soap in @($soap1, $soap2)) {
+        try {
+            $response = Invoke-WebRequest -Uri $EwsUrl -Method POST -Body $soap -Headers $headers `
+                            -UseDefaultCredentials -ErrorAction Stop
+            [xml]$xml = $response.Content
+
+            # Check for SOAP fault
+            $fault = $xml.SelectSingleNode('//s:Fault/faultstring', $ns)
+            if ($fault) { $lastError = $fault.InnerText; continue }
+
+            # Check for error response
+            $respMsg = $xml.SelectNodes('//*[@ResponseClass]', $ns)
+            $hasError = $false
+            foreach ($r in $respMsg) {
+                if ($r.ResponseClass -eq 'Error') {
+                    $lastError = $r.MessageText
+                    $hasError = $true
+                    break
+                }
+            }
+            if ($hasError) { continue }
+
+            return $xml
+        } catch {
+            $lastError = "$_"
+        }
+    }
+
+    throw "EWS request failed: $lastError"
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # EWS MESSAGE PREVIEW
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -115,6 +211,7 @@ function Get-MailboxMessagePreview {
     <#
     .SYNOPSIS
         Retrieve individual messages matching a KQL query via EWS FindItem.
+        Tries without impersonation first (Full Access), then with impersonation.
         Returns array of message objects with Subject, From, To, Received, Size.
     #>
     [CmdletBinding()]
@@ -130,21 +227,10 @@ function Get-MailboxMessagePreview {
     }
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+    $escapedQuery = [System.Security.SecurityElement]::Escape($SearchQuery)
 
-    $soap = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-    <t:RequestServerVersion Version="Exchange2013_SP1" />
-  </soap:Header>
-  <soap:Body>
+    $soapBody = @"
     <m:FindItem Traversal="Shallow">
       <m:ItemShape>
         <t:BaseShape>Default</t:BaseShape>
@@ -166,37 +252,20 @@ function Get-MailboxMessagePreview {
         </t:FieldOrder>
       </m:SortOrder>
       <m:ParentFolderIds>
-        <t:DistinguishedFolderId Id="root">
-          <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
+        <t:DistinguishedFolderId Id="msgfolderroot">
+          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
         </t:DistinguishedFolderId>
       </m:ParentFolderIds>
-      <m:QueryString>$([System.Security.SecurityElement]::Escape($SearchQuery))</m:QueryString>
+      <m:QueryString>$escapedQuery</m:QueryString>
     </m:FindItem>
-  </soap:Body>
-</soap:Envelope>
 "@
 
-    # Allow self-signed certs on internal Exchange
-    try {
-        [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-    } catch {}
-
-    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
-    $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
-                    -UseDefaultCredentials -ErrorAction Stop
-
-    [xml]$xml = $response.Content
+    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
     $ns = @{
-        s  = 'http://schemas.xmlsoap.org/soap/envelope/'
-        m  = 'http://schemas.microsoft.com/exchange/services/2006/messages'
-        t  = 'http://schemas.microsoft.com/exchange/services/2006/types'
+        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
     }
-
     $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
-    if (-not $responseMsg -or $responseMsg.ResponseClass -ne 'Success') {
-        $errMsg = if ($responseMsg) { $responseMsg.MessageText } else { 'EWS FindItem failed' }
-        throw $errMsg
-    }
 
     $items = $xml.SelectNodes('//t:Message', $ns)
     $results = @()
@@ -914,20 +983,7 @@ function Invoke-FolderCleanupEWS {
     }
 
     # FindItem to get items in the folder
-    $soap = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-    <t:RequestServerVersion Version="Exchange2013_SP1" />
-  </soap:Header>
-  <soap:Body>
+    $soapBody = @"
     <m:FindItem Traversal="Shallow">
       <m:ItemShape>
         <t:BaseShape>IdOnly</t:BaseShape>
@@ -950,24 +1006,12 @@ function Invoke-FolderCleanupEWS {
       </m:ParentFolderIds>
       $queryStringXml
     </m:FindItem>
-  </soap:Body>
-</soap:Envelope>
 "@
 
-    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
-    $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
-                    -UseDefaultCredentials -ErrorAction Stop
-    [xml]$xml = $response.Content
+    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
     $ns = @{
-        s = 'http://schemas.xmlsoap.org/soap/envelope/'
         m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
         t = 'http://schemas.microsoft.com/exchange/services/2006/types'
-    }
-
-    $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
-    if (-not $responseMsg -or $responseMsg.ResponseClass -ne 'Success') {
-        $errMsg = if ($responseMsg) { $responseMsg.MessageText } else { 'EWS FindItem failed' }
-        throw $errMsg
     }
 
     $totalCount = 0
@@ -1001,30 +1045,14 @@ function Invoke-FolderCleanupEWS {
                 "<t:ItemId Id=`"$($_.Id)`" ChangeKey=`"$($_.ChangeKey)`" />"
             }) -join "`n"
 
-            $deleteSoap = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-    <t:RequestServerVersion Version="Exchange2013_SP1" />
-  </soap:Header>
-  <soap:Body>
+            $deleteBody = @"
     <m:DeleteItem DeleteType="SoftDelete" AffectedTaskOccurrences="AllOccurrences">
       <m:ItemIds>
         $itemIdXml
       </m:ItemIds>
     </m:DeleteItem>
-  </soap:Body>
-</soap:Envelope>
 "@
-            $null = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $deleteSoap -Headers $headers `
-                        -UseDefaultCredentials -ErrorAction Stop
+            $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
         }
     }
 
@@ -1059,7 +1087,6 @@ function Find-EwsFolderId {
     )
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
-    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
     $ns = @{
         m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
         t = 'http://schemas.microsoft.com/exchange/services/2006/types'
@@ -1074,32 +1101,15 @@ function Find-EwsFolderId {
 "@
 
     foreach ($part in $pathParts) {
-        $soap = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:ExchangeImpersonation>
-      <t:ConnectingSID>
-        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
-      </t:ConnectingSID>
-    </t:ExchangeImpersonation>
-    <t:RequestServerVersion Version="Exchange2013_SP1" />
-  </soap:Header>
-  <soap:Body>
+        $findFolderBody = @"
     <m:FindFolder Traversal="Shallow">
       <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape>
         <t:AdditionalProperties><t:FieldURI FieldURI="folder:DisplayName" /></t:AdditionalProperties>
       </m:FolderShape>
       <m:ParentFolderIds>$currentParent</m:ParentFolderIds>
     </m:FindFolder>
-  </soap:Body>
-</soap:Envelope>
 "@
-        $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
-                        -UseDefaultCredentials -ErrorAction Stop
-        [xml]$xml = $response.Content
+        $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $findFolderBody -Mailbox $Mailbox
 
         $folders = $xml.SelectNodes('//t:Folder', $ns)
         $match = $null

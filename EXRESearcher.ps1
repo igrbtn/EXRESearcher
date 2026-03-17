@@ -564,7 +564,74 @@ function Show-EXRESearcherGUI {
             $timer.Start()
         })
 
-        $btnBar.Controls.AddRange(@($btnCancel, $btnExec, $btnCopy))
+        $btnWhatIf = New-Btn -Text 'WhatIf' -W 90 -Color 'Orange'
+        $btnWhatIf.Add_Click({
+            try {
+                # Take command from textbox, append -WhatIf to each line
+                $lines = $txt.Text -split "`r?`n"
+                $whatIfCmd = @()
+                foreach ($line in $lines) {
+                    $l = $line.Trim()
+                    if (-not $l -or $l.StartsWith('#')) { continue }
+                    if ($l -notmatch '-WhatIf') { $l += ' -WhatIf' }
+                    $whatIfCmd += $l
+                }
+                if ($whatIfCmd.Count -eq 0) { return }
+                $script = $whatIfCmd -join "`r`n"
+
+                # Run WhatIf and capture output
+                $btnWhatIf.Enabled = $false
+                $btnWhatIf.Text = 'Running...'
+                $dlg.Refresh()
+
+                $output = try {
+                    $sb = [scriptblock]::Create($script)
+                    & $sb 2>&1 | Out-String
+                } catch { "Error: $_" }
+
+                # Show output in a result dialog
+                $resDlg = New-Object System.Windows.Forms.Form
+                $resDlg.Text = 'WhatIf Results'
+                $resDlg.Size = New-Object System.Drawing.Size(700, 400)
+                $resDlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+                $resDlg.StartPosition = 'CenterParent'
+
+                $resTxt = New-Object System.Windows.Forms.TextBox
+                $resTxt.Multiline = $true
+                $resTxt.ScrollBars = 'Both'
+                $resTxt.WordWrap = $false
+                $resTxt.Font = New-Object System.Drawing.Font('Consolas', 10)
+                $resTxt.Dock = 'Fill'
+                $resTxt.ReadOnly = $true
+                $resTxt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+                $resTxt.ForeColor = [System.Drawing.Color]::FromArgb(180,220,180)
+                $resTxt.Text = "# Command:`r`n$script`r`n`r`n# Output:`r`n$output"
+
+                $resBar = New-Object System.Windows.Forms.FlowLayoutPanel
+                $resBar.Dock = 'Bottom'
+                $resBar.Height = 44
+                $resBar.FlowDirection = 'RightToLeft'
+                $resBar.Padding = New-Object System.Windows.Forms.Padding(6)
+                $resClose = New-Btn -Text 'Close' -W 90
+                $resClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+                $resCopy = New-Btn -Text 'Copy' -W 90 -Color 'Blue'
+                $resCopy.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($resTxt.Text) })
+                $resBar.Controls.AddRange(@($resClose, $resCopy))
+
+                $resDlg.Controls.Add($resTxt)
+                $resDlg.Controls.Add($resBar)
+                $resTxt.BringToFront()
+                [void]$resDlg.ShowDialog($dlg)
+                $resDlg.Dispose()
+            } catch {
+                [System.Windows.Forms.MessageBox]::Show("WhatIf error: $_", 'Error', 'OK', 'Error')
+            } finally {
+                $btnWhatIf.Enabled = $true
+                $btnWhatIf.Text = 'WhatIf'
+            }
+        })
+
+        $btnBar.Controls.AddRange(@($btnCancel, $btnExec, $btnWhatIf, $btnCopy))
         $dlg.Controls.Add($txt)
         $dlg.Controls.Add($lbl)
         $dlg.Controls.Add($btnBar)

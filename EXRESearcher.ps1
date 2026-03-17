@@ -222,7 +222,13 @@ function Show-EXRESearcherGUI {
     $lblConnStatus = New-InlineLabel -Text 'Not connected' -MarginLeft 6
     $lblConnStatus.ForeColor = [System.Drawing.Color]::Gray
 
-    $topPanel.Controls.AddRange(@($lblServer, $txtServer, $btnConnect, $btnDisconnect, $lblConnStatus))
+    $chkSafeMode = New-Object System.Windows.Forms.CheckBox
+    $chkSafeMode.Text = 'Safe Mode (Show commands)'
+    $chkSafeMode.AutoSize = $true
+    $chkSafeMode.Margin = New-Object System.Windows.Forms.Padding(20,8,3,4)
+    $chkSafeMode.ForeColor = [System.Drawing.Color]::FromArgb(100,100,100)
+
+    $topPanel.Controls.AddRange(@($lblServer, $txtServer, $btnConnect, $btnDisconnect, $lblConnStatus, $chkSafeMode))
     $form.Controls.Add($topPanel)
 
     # ─── Status Bar ──────────────────────────────────────────────────────────
@@ -437,8 +443,11 @@ function Show-EXRESearcherGUI {
         } -OnError {
             param($err)
             Update-StatusBar "Preview error: $err"
+            $fixMsg = if ($err -match '(?i)denied|impersonat|403|401|unauthorized') {
+                "`n`nFix: Run this in Exchange Management Shell:`nNew-ManagementRoleAssignment -Name `"EWSImpersonation`" -Role `"ApplicationImpersonation`" -User $env:USERNAME"
+            } else { '' }
             [System.Windows.Forms.MessageBox]::Show(
-                "Could not load message preview:`n$err`n`nNote: EWS impersonation rights may be required.",
+                "Could not load message preview:`n$err$fixMsg",
                 'Preview Error', 'OK', 'Warning')
         }
     })
@@ -501,6 +510,137 @@ function Show-EXRESearcherGUI {
         return $true
     }
 
+    # --- Safe Mode: show command preview ---
+    # Returns 'Execute' to proceed, 'Cancel' to abort
+    $showCommandPreview = {
+        param([string]$CommandText, [string]$Title = 'Command Preview')
+        if (-not $chkSafeMode.Checked) { return 'Execute' }
+
+        $dlg = New-Object System.Windows.Forms.Form
+        $dlg.Text = "Safe Mode: $Title"
+        $dlg.Size = New-Object System.Drawing.Size(750, 420)
+        $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $dlg.StartPosition = 'CenterParent'
+        $dlg.MinimumSize = New-Object System.Drawing.Size(500, 300)
+        $dlg.FormBorderStyle = 'Sizable'
+        $dlg.MaximizeBox = $false
+
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = 'PowerShell command that will be executed:'
+        $lbl.Dock = 'Top'
+        $lbl.Height = 24
+        $lbl.Padding = New-Object System.Windows.Forms.Padding(6,6,0,0)
+
+        $txt = New-Object System.Windows.Forms.TextBox
+        $txt.Multiline = $true
+        $txt.ScrollBars = 'Both'
+        $txt.WordWrap = $false
+        $txt.Font = New-Object System.Drawing.Font('Consolas', 10)
+        $txt.Text = $CommandText
+        $txt.Dock = 'Fill'
+        $txt.ReadOnly = $false
+        $txt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+        $txt.ForeColor = [System.Drawing.Color]::FromArgb(220,220,180)
+
+        $btnBar = New-Object System.Windows.Forms.FlowLayoutPanel
+        $btnBar.Dock = 'Bottom'
+        $btnBar.Height = 44
+        $btnBar.FlowDirection = 'RightToLeft'
+        $btnBar.Padding = New-Object System.Windows.Forms.Padding(6)
+
+        $btnCancel = New-Btn -Text 'Cancel' -W 90
+        $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
+        $btnCopy = New-Btn -Text 'Copy' -W 90 -Color 'Blue'
+        $btnExec = New-Btn -Text 'Execute' -W 90 -Color 'Green'
+        $btnExec.DialogResult = [System.Windows.Forms.DialogResult]::OK
+
+        $btnCopy.Add_Click({
+            [System.Windows.Forms.Clipboard]::SetText($txt.Text)
+            $btnCopy.Text = 'Copied!'
+            $timer = New-Object System.Windows.Forms.Timer
+            $timer.Interval = 1500
+            $timer.Add_Tick({ $btnCopy.Text = 'Copy'; $timer.Stop(); $timer.Dispose() })
+            $timer.Start()
+        })
+
+        $btnBar.Controls.AddRange(@($btnCancel, $btnExec, $btnCopy))
+        $dlg.Controls.Add($txt)
+        $dlg.Controls.Add($lbl)
+        $dlg.Controls.Add($btnBar)
+        $txt.BringToFront()
+        $dlg.AcceptButton = $btnExec
+        $dlg.CancelButton = $btnCancel
+
+        $result = $dlg.ShowDialog($form)
+        $dlg.Dispose()
+        if ($result -eq [System.Windows.Forms.DialogResult]::OK) { return 'Execute' }
+        return 'Cancel'
+    }
+
+    # --- Delete confirmation with data loss warning ---
+    # Returns 'OK' to proceed, 'ShowScript' to show command, 'Cancel' to abort
+    $confirmDelete = {
+        param([string]$Message, [string]$CommandText)
+
+        $dlg = New-Object System.Windows.Forms.Form
+        $dlg.Text = 'Confirm Delete'
+        $dlg.Size = New-Object System.Drawing.Size(500, 220)
+        $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+        $dlg.StartPosition = 'CenterParent'
+        $dlg.FormBorderStyle = 'FixedDialog'
+        $dlg.MaximizeBox = $false
+        $dlg.MinimizeBox = $false
+
+        $iconBox = New-Object System.Windows.Forms.PictureBox
+        $iconBox.Image = [System.Drawing.SystemIcons]::Warning.ToBitmap()
+        $iconBox.Size = New-Object System.Drawing.Size(40,40)
+        $iconBox.Location = New-Object System.Drawing.Point(15,15)
+        $iconBox.SizeMode = 'Zoom'
+
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $Message
+        $lbl.Location = New-Object System.Drawing.Point(65, 15)
+        $lbl.Size = New-Object System.Drawing.Size(410, 60)
+
+        $chkConfirm = New-Object System.Windows.Forms.CheckBox
+        $chkConfirm.Text = 'I understand that data may be permanently lost'
+        $chkConfirm.Location = New-Object System.Drawing.Point(65, 85)
+        $chkConfirm.AutoSize = $true
+        $chkConfirm.Font = New-Object System.Drawing.Font('Segoe UI', 9, [System.Drawing.FontStyle]::Bold)
+
+        $btnBar = New-Object System.Windows.Forms.FlowLayoutPanel
+        $btnBar.Dock = 'Bottom'
+        $btnBar.Height = 44
+        $btnBar.FlowDirection = 'RightToLeft'
+        $btnBar.Padding = New-Object System.Windows.Forms.Padding(6)
+
+        $btnCancel = New-Btn -Text 'Cancel' -W 90
+        $btnOK = New-Btn -Text 'Delete' -W 90 -Color 'Red'
+        $btnOK.Enabled = $false
+        $btnScript = New-Btn -Text 'Show Script' -W 100 -Color 'Blue'
+
+        $script:deleteDialogResult = 'Cancel'
+        $chkConfirm.Add_CheckedChanged({ $btnOK.Enabled = $chkConfirm.Checked })
+        $btnOK.Add_Click({ $script:deleteDialogResult = 'OK'; $dlg.Close() })
+        $btnCancel.Add_Click({ $script:deleteDialogResult = 'Cancel'; $dlg.Close() })
+        $btnScript.Add_Click({
+            $script:deleteDialogResult = 'ShowScript'; $dlg.Close()
+        })
+
+        $btnBar.Controls.AddRange(@($btnCancel, $btnOK, $btnScript))
+        $dlg.Controls.AddRange(@($iconBox, $lbl, $chkConfirm, $btnBar))
+
+        [void]$dlg.ShowDialog($form)
+        $dlg.Dispose()
+
+        if ($script:deleteDialogResult -eq 'ShowScript') {
+            # Show the command preview, then return Cancel (user can copy and run manually)
+            & $showCommandPreview -CommandText $CommandText -Title 'Delete Command'
+            return 'Cancel'
+        }
+        return $script:deleteDialogResult
+    }
+
     # --- Search actions ---
     $doSearch = {
         param([string]$Action)
@@ -511,19 +651,38 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter mailbox(es) in Scope field.','Scope Required','OK','Warning')
             return
         }
-        if ($Action -eq 'DeleteContent') {
-            $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "DELETE content matching:`n$query`n`nFrom $($mailboxes.Count) mailbox(es)?`n`nThis action is IRREVERSIBLE!",
-                'Confirm Delete', 'YesNo', 'Warning')
-            if ($confirm -ne 'Yes') { return }
-        }
         if ($Action -in @('LogOnly','CopyToFolder') -and -not $txtTarget.Text) {
             [System.Windows.Forms.MessageBox]::Show('Enter a Target Mailbox for Log/Copy operations.','Target Required','OK','Warning')
             return
         }
-        Update-StatusBar "Searching ($Action)..."
         $targetMbx = if ($Action -in @('LogOnly','CopyToFolder')) { $txtTarget.Text } else { '' }
         $targetFld = $txtTargetFolder.Text
+
+        # Build command string for preview
+        $mbxList = $mailboxes -join ', '
+        $cmdLines = @()
+        foreach ($m in $mailboxes) {
+            $cmd = "Search-Mailbox -Identity `"$m`" -SearchQuery `"$query`""
+            switch ($Action) {
+                'Estimate'      { $cmd += " -EstimateResultOnly" }
+                'LogOnly'       { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`" -LogOnly" }
+                'CopyToFolder'  { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`"" }
+                'DeleteContent' { $cmd += " -DeleteContent -Force" }
+            }
+            $cmdLines += $cmd
+        }
+        $cmdText = $cmdLines -join "`r`n"
+
+        # Delete confirmation with data loss warning
+        if ($Action -eq 'DeleteContent') {
+            $result = & $confirmDelete -Message "DELETE content matching:`n$query`n`nFrom $($mailboxes.Count) mailbox(es). This action is IRREVERSIBLE!" -CommandText $cmdText
+            if ($result -ne 'OK') { return }
+        } else {
+            # Safe mode preview for non-destructive actions
+            if ((& $showCommandPreview -CommandText $cmdText -Title "Search-Mailbox ($Action)") -eq 'Cancel') { return }
+        }
+
+        Update-StatusBar "Searching ($Action)..."
 
         Start-AsyncJob -Name "Search ($Action)" -Form $form -ScriptBlock {
             param($Mailboxes, $SearchQuery, $Action, $TargetMailbox, $TargetFolder)
@@ -576,6 +735,8 @@ function Show-EXRESearcherGUI {
 
     $btnCheckPerms.Add_Click({
         if (-not (& $requireConnection)) { return }
+        $cmdText = "Get-ManagementRoleAssignment -Role `"Mailbox Search`" -GetEffectiveUsers | Where { `$_.EffectiveUserName -eq `$env:USERNAME }`r`nGet-ManagementRoleAssignment -Role `"Discovery Management`" -GetEffectiveUsers | Where { `$_.EffectiveUserName -eq `$env:USERNAME }`r`nGet-Mailbox -RecipientTypeDetails DiscoveryMailbox"
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Check Permissions') -eq 'Cancel') { return }
         Update-StatusBar 'Checking permissions...'
         Start-AsyncJob -Name 'CheckPermissions' -Form $form -ScriptBlock {
             $perms = Test-SearchPermissions
@@ -759,8 +920,11 @@ function Show-EXRESearcherGUI {
         } -OnError {
             param($err)
             Update-StatusBar "Preview error: $err"
+            $fixMsg = if ($err -match '(?i)denied|impersonat|403|401|unauthorized') {
+                "`n`nFix: Run this in Exchange Management Shell:`nNew-ManagementRoleAssignment -Name `"EWSImpersonation`" -Role `"ApplicationImpersonation`" -User $env:USERNAME"
+            } else { '' }
             [System.Windows.Forms.MessageBox]::Show(
-                "Could not load message preview:`n$err`n`nNote: EWS impersonation rights may be required.",
+                "Could not load message preview:`n$err$fixMsg",
                 'Preview Error', 'OK', 'Warning')
         }
     })
@@ -802,18 +966,23 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Wildcard search on all mailboxes is not allowed. Add filters.','Safety Check','OK','Error')
             return
         }
-        if ($Delete) {
-            $confirm = [System.Windows.Forms.MessageBox]::Show(
-                "DELETE from ALL MAILBOXES matching:`n$query`n`nThis is IRREVERSIBLE! Continue?",
-                'CONFIRM ORG-WIDE DELETE', 'YesNo', 'Warning')
-            if ($confirm -ne 'Yes') { return }
-            $confirm2 = [System.Windows.Forms.MessageBox]::Show(
-                "Are you ABSOLUTELY sure? Type the query to the operator log?",
-                'FINAL CONFIRMATION', 'YesNo', 'Warning')
-            if ($confirm2 -ne 'Yes') { return }
-        }
 
         $batchSize = [int]$nudOrgBatch.Value
+        $cmdText = "Get-Mailbox -ResultSize Unlimited | Search-Mailbox -SearchQuery `"$query`""
+        if ($Delete) {
+            $cmdText += " -DeleteContent -Force"
+        } else {
+            $cmdText += " -EstimateResultOnly"
+        }
+        $cmdText += "`r`n# BatchSize: $batchSize mailboxes per batch"
+
+        if ($Delete) {
+            $result = & $confirmDelete -Message "DELETE from ALL MAILBOXES matching:`n$query`n`nThis searches every mailbox in the organization. This action is IRREVERSIBLE!" -CommandText $cmdText
+            if ($result -ne 'OK') { return }
+        } else {
+            if ((& $showCommandPreview -CommandText $cmdText -Title 'Org-Wide Estimate') -eq 'Cancel') { return }
+        }
+
         $whatIf = -not $Delete
         Update-StatusBar "Org-wide $(if ($Delete) { 'DELETE' } else { 'estimate' })..."
 
@@ -943,6 +1112,7 @@ function Show-EXRESearcherGUI {
     # --- Compliance actions ---
     $refreshCompliance = {
         if (-not (& $requireConnection)) { return }
+        if ((& $showCommandPreview -CommandText 'Get-MailboxSearch' -Title 'eDiscovery List') -eq 'Cancel') { return }
         Update-StatusBar 'Loading eDiscovery searches...'
         Start-AsyncJob -Name 'eDiscovery List' -Form $form -ScriptBlock {
             return @(Get-ContentSearches)
@@ -977,6 +1147,12 @@ function Show-EXRESearcherGUI {
                 $mbxList = @($txtCompMailboxes.Text -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
             }
             $estimateOnly = $chkCompEstimate.Checked
+            $cmdText = "New-MailboxSearch -Name `"$name`" -SearchQuery `"$query`""
+            if ($allMbx) { $cmdText += " -AllMailboxes" }
+            elseif ($mbxList.Count -gt 0) { $cmdText += " -SourceMailboxes `"$($mbxList -join '","')`"" }
+            if ($estimateOnly) { $cmdText += " -EstimateOnly" }
+            $cmdText += "`r`nStart-MailboxSearch -Identity `"$name`""
+            if ((& $showCommandPreview -CommandText $cmdText -Title 'Create eDiscovery Search') -eq 'Cancel') { return }
             Update-StatusBar "Creating eDiscovery search '$name'..."
 
             Start-AsyncJob -Name "Create eDiscovery: $name" -Form $form -ScriptBlock {
@@ -1126,9 +1302,13 @@ function Show-EXRESearcherGUI {
 
     $btnMbxLoad.Add_Click({
         if (-not (& $requireConnection)) { return }
-        Update-StatusBar 'Loading mailboxes...'
         $filterVal = $txtMbxFilter.Text
         $typeVal = $cmbMbxType.SelectedItem.ToString()
+        $cmdText = "Get-Mailbox -ResultSize 500"
+        if ($filterVal) { $cmdText += " -Filter `"DisplayName -like '*$filterVal*' -or PrimarySmtpAddress -like '*$filterVal*'`"" }
+        if ($typeVal -ne 'All') { $cmdText += " -RecipientTypeDetails $typeVal" }
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Load Mailboxes') -eq 'Cancel') { return }
+        Update-StatusBar 'Loading mailboxes...'
         Start-AsyncJob -Name 'LoadMailboxes' -Form $form -ScriptBlock {
             param($Filter, $RecipientType)
             $params = @{ RecipientType = $RecipientType }
@@ -1155,6 +1335,8 @@ function Show-EXRESearcherGUI {
                 if ($smtp) { $selected += $smtp }
             }
             if ($selected.Count -eq 0) { return }
+            $cmdText = ($selected | ForEach-Object { "Get-MailboxStatistics -Identity `"$_`"" }) -join "`r`n"
+            if ((& $showCommandPreview -CommandText $cmdText -Title 'Mailbox Statistics') -eq 'Cancel') { return }
             Update-StatusBar "Getting stats for $($selected.Count) mailbox(es)..."
             Start-AsyncJob -Name 'MailboxStats' -Form $form -ScriptBlock {
                 param($Mailboxes)
@@ -1175,6 +1357,7 @@ function Show-EXRESearcherGUI {
             if ($dgvMailboxes.SelectedRows.Count -eq 0) { return }
             $smtp = "$($dgvMailboxes.SelectedRows[0].Cells['PrimarySmtp'].Value)"
             if (-not $smtp) { return }
+            if ((& $showCommandPreview -CommandText "Get-MailboxFolderStatistics -Identity `"$smtp`"" -Title 'Folder Statistics') -eq 'Cancel') { return }
             Update-StatusBar "Loading folder stats for $smtp..."
             Start-AsyncJob -Name "Folders: $smtp" -Form $form -ScriptBlock {
                 param($Mailbox)
@@ -1366,6 +1549,7 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
             return
         }
+        if ((& $showCommandPreview -CommandText "Get-MailboxFolderStatistics -Identity `"$mbx`" | Select FolderPath, ItemsInFolder, FolderSize" -Title 'Load Folders') -eq 'Cancel') { return }
         Update-StatusBar "Loading folders for $mbx..."
         $btnFcLoadFolders.Enabled = $false
         Start-AsyncJob -Name "Folders $mbx" -Form $form -ScriptBlock {
@@ -1392,6 +1576,28 @@ function Show-EXRESearcherGUI {
         }
     })
 
+    # Helper: build folder cleanup command text for safe mode
+    $buildFcCommand = {
+        param($Mbx, $Folder, $Subj, $Frm, $Days, $Sz, $Att, $Action)
+        $parts = @()
+        if ($Subj) { $parts += "subject:`"$Subj`"" }
+        if ($Frm)  { $parts += "from:`"$Frm`"" }
+        if ($Days -gt 0) { $parts += "received<=$((Get-Date).AddDays(-$Days).ToString('yyyy-MM-dd'))" }
+        if ($Att)  { $parts += "hasattachment:true" }
+        $q = if ($parts.Count -gt 0) { $parts -join ' AND ' } else { '*' }
+
+        if ($Folder) {
+            $cmd = "# EWS FindItem on folder `"$Folder`" in mailbox `"$Mbx`"`r`n"
+            $cmd += "# Query: $q`r`n"
+            if ($Sz) { $cmd += "# Size filter: $Sz`r`n" }
+            $cmd += "# Equivalent Search-Mailbox (all folders):`r`n"
+        } else { $cmd = '' }
+        $cmd += "Search-Mailbox -Identity `"$Mbx`" -SearchQuery `"$q`""
+        if ($Action -eq 'Estimate') { $cmd += " -EstimateResultOnly" }
+        else { $cmd += " -DeleteContent -Force" }
+        return $cmd
+    }
+
     $btnFcEstimate.Add_Click({
         if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
@@ -1405,11 +1611,14 @@ function Show-EXRESearcherGUI {
         $days = [int]$numFcDays.Value
         $sz = if ($cmbFcSize.SelectedItem -and $cmbFcSize.SelectedItem -ne 'Any') { $cmbFcSize.SelectedItem } else { '' }
         $att = $chkFcAttach.Checked
+        $cmdText = & $buildFcCommand -Mbx $mbx -Folder $folder -Subj $subj -Frm $frm -Days $days -Sz $sz -Att $att -Action 'Estimate'
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Folder Estimate') -eq 'Cancel') { return }
         Update-StatusBar "Estimating folder cleanup for $mbx..."
         $btnFcEstimate.Enabled = $false
 
+        $srv = $txtServer.Text.Trim()
         Start-AsyncJob -Name "Folder Estimate $mbx" -Form $form -ScriptBlock {
-            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment)
+            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment, $Server)
             $p = @{ Mailbox = $Mailbox; Action = 'Estimate' }
             if ($FolderPath)    { $p['FolderPath'] = $FolderPath }
             if ($Subject)       { $p['Subject'] = $Subject }
@@ -1417,10 +1626,11 @@ function Show-EXRESearcherGUI {
             if ($OlderThanDays -gt 0) { $p['OlderThanDays'] = $OlderThanDays }
             if ($SizeRange)     { $p['SizeRange'] = $SizeRange }
             if ($HasAttachment) { $p['HasAttachment'] = $true }
+            if ($Server)        { $p['Server'] = $Server }
             Invoke-FolderCleanup @p
         } -Parameters @{
             Mailbox = $mbx; FolderPath = $folder; Subject = $subj; From = $frm
-            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att
+            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att; Server = $srv
         } -OnComplete {
             param($result)
             try {
@@ -1434,9 +1644,13 @@ function Show-EXRESearcherGUI {
             $btnFcEstimate.Enabled = $true
         } -OnError {
             param($err)
-            $btnFcEstimate.Enabled = $false
-            Update-StatusBar "Folder estimate error: $err"
             $btnFcEstimate.Enabled = $true
+            Update-StatusBar "Folder estimate error: $err"
+            if ($err -match '(?i)denied|impersonat|403|401|unauthorized') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "EWS access denied.`n`nFix: Run this in Exchange Management Shell:`nNew-ManagementRoleAssignment -Name `"EWSImpersonation`" -Role `"ApplicationImpersonation`" -User $env:USERNAME",
+                    'EWS Impersonation Required', 'OK', 'Warning')
+            }
         }
     })
 
@@ -1447,22 +1661,22 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
             return
         }
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Delete matching messages from $mbx?`nThis action is permanent.`n`nAre you sure?",
-            'Confirm Folder Delete', 'YesNo', 'Warning')
-        if ($confirm -ne 'Yes') { return }
-
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
         $subj = $txtFcSubject.Text.Trim()
         $frm = $txtFcFrom.Text.Trim()
         $days = [int]$numFcDays.Value
         $sz = if ($cmbFcSize.SelectedItem -and $cmbFcSize.SelectedItem -ne 'Any') { $cmbFcSize.SelectedItem } else { '' }
         $att = $chkFcAttach.Checked
+        $cmdText = & $buildFcCommand -Mbx $mbx -Folder $folder -Subj $subj -Frm $frm -Days $days -Sz $sz -Att $att -Action 'Delete'
+        $folderInfo = if ($folder) { " from folder `"$folder`"" } else { '' }
+        $result = & $confirmDelete -Message "Delete matching messages from $mbx$folderInfo?`nThis action is permanent!" -CommandText $cmdText
+        if ($result -ne 'OK') { return }
         Update-StatusBar "Deleting messages from $mbx..."
         $btnFcDelete.Enabled = $false
 
+        $srv = $txtServer.Text.Trim()
         Start-AsyncJob -Name "Folder Delete $mbx" -Form $form -ScriptBlock {
-            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment)
+            param($Mailbox, $FolderPath, $Subject, $From, $OlderThanDays, $SizeRange, $HasAttachment, $Server)
             $p = @{ Mailbox = $Mailbox; Action = 'DeleteContent' }
             if ($FolderPath)    { $p['FolderPath'] = $FolderPath }
             if ($Subject)       { $p['Subject'] = $Subject }
@@ -1470,10 +1684,11 @@ function Show-EXRESearcherGUI {
             if ($OlderThanDays -gt 0) { $p['OlderThanDays'] = $OlderThanDays }
             if ($SizeRange)     { $p['SizeRange'] = $SizeRange }
             if ($HasAttachment) { $p['HasAttachment'] = $true }
+            if ($Server)        { $p['Server'] = $Server }
             Invoke-FolderCleanup @p
         } -Parameters @{
             Mailbox = $mbx; FolderPath = $folder; Subject = $subj; From = $frm
-            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att
+            OlderThanDays = $days; SizeRange = $sz; HasAttachment = $att; Server = $srv
         } -OnComplete {
             param($result)
             try {
@@ -1490,6 +1705,11 @@ function Show-EXRESearcherGUI {
             param($err)
             $btnFcDelete.Enabled = $true
             Update-StatusBar "Folder delete error: $err"
+            if ($err -match '(?i)denied|impersonat|403|401|unauthorized') {
+                [System.Windows.Forms.MessageBox]::Show(
+                    "EWS access denied.`n`nFix: Run this in Exchange Management Shell:`nNew-ManagementRoleAssignment -Name `"EWSImpersonation`" -Role `"ApplicationImpersonation`" -User $env:USERNAME",
+                    'EWS Impersonation Required', 'OK', 'Warning')
+            }
         }
     })
 
@@ -1500,11 +1720,25 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter a mailbox.','Folder Cleanup','OK','Warning')
             return
         }
+        $cmdEstimate = "Search-Mailbox -Identity `"$mbx`" -SearchDumpsterOnly -EstimateResultOnly"
+        $cmdDelete = "Search-Mailbox -Identity `"$mbx`" -SearchDumpsterOnly -DeleteContent -Force"
+
+        # First ask estimate or delete
         $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "Purge recoverable/deleted items from $mbx?`nThis permanently removes items from the dumpster.`n`nEstimate first?",
-            'Dumpster Purge', 'YesNoCancel', 'Warning')
+            "Purge recoverable/deleted items from $mbx?`n`nEstimate first (recommended)?",
+            'Dumpster Purge', 'YesNoCancel', 'Question')
         if ($confirm -eq 'Cancel') { return }
-        $action = if ($confirm -eq 'No') { 'DeleteContent' } else { 'Estimate' }
+
+        if ($confirm -eq 'No') {
+            # Delete — use confirmDelete dialog
+            $result = & $confirmDelete -Message "Permanently purge all recoverable items from $mbx?`nThis action is IRREVERSIBLE!" -CommandText $cmdDelete
+            if ($result -ne 'OK') { return }
+            $action = 'DeleteContent'
+        } else {
+            # Estimate — use safe mode
+            if ((& $showCommandPreview -CommandText $cmdEstimate -Title 'Dumpster Estimate') -eq 'Cancel') { return }
+            $action = 'Estimate'
+        }
 
         Update-StatusBar "Purging dumpster for $mbx ($action)..."
         $btnFcPurge.Enabled = $false
@@ -1538,6 +1772,10 @@ function Show-EXRESearcherGUI {
             return
         }
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
+        $cmdText = "# Scan for duplicate messages (by Subject + Sender + Date)`r`nGet-MailboxFolderStatistics -Identity `"$mbx`""
+        if ($folder) { $cmdText += " | Where FolderPath -eq `"/$folder`"" }
+        $cmdText += "`r`n# Then compare items within each folder for duplicates"
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Find Duplicates') -eq 'Cancel') { return }
         Update-StatusBar "Scanning for duplicates in $mbx..."
         $btnFcFindDupes.Enabled = $false
 
@@ -1576,6 +1814,8 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
             return
         }
+        $cmdText = "Search-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -TargetMailbox `"$target`" -TargetFolder `"Backup-$folder`" -LogOnly"
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Backup Folder') -eq 'Cancel') { return }
         Update-StatusBar "Backing up folder $folder from $mbx..."
         $btnFcBackupDupes.Enabled = $false
 
@@ -1612,10 +1852,9 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
             return
         }
-        $confirm = [System.Windows.Forms.MessageBox]::Show(
-            "This will BACKUP folder content to $target, then DELETE from $mbx.`n`nFolder: $folder`n`nProceed?",
-            'Confirm Backup + Delete', 'YesNo', 'Warning')
-        if ($confirm -ne 'Yes') { return }
+        $cmdText = "# Step 1: Backup`r`nSearch-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -TargetMailbox `"$target`" -TargetFolder `"Backup-$folder`"`r`n# Step 2: Delete`r`nSearch-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -DeleteContent -Force"
+        $result = & $confirmDelete -Message "BACKUP folder content to $target, then DELETE from $mbx.`n`nFolder: $folder" -CommandText $cmdText
+        if ($result -ne 'OK') { return }
 
         Update-StatusBar "Backup + Delete folder $folder from $mbx..."
         $btnFcRemoveDupes.Enabled = $false
@@ -1654,6 +1893,8 @@ function Show-EXRESearcherGUI {
             [System.Windows.Forms.MessageBox]::Show('Enter an Exchange server name.','Connect','OK','Warning')
             return
         }
+        $cmdText = "`$session = New-PSSession -ConfigurationName 'Microsoft.Exchange' -ConnectionUri `"http://$server/PowerShell/`" -Authentication Kerberos`r`nImport-PSSession `$session -DisableNameChecking -AllowClobber"
+        if ((& $showCommandPreview -CommandText $cmdText -Title 'Connect to Exchange') -eq 'Cancel') { return }
         Update-StatusBar "Connecting to $server..."
         $lblConnStatus.Text = 'Connecting...'
         $lblConnStatus.ForeColor = [System.Drawing.Color]::FromArgb(200,150,0)

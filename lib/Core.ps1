@@ -806,22 +806,8 @@ function Invoke-FolderCleanup {
     <#
     .SYNOPSIS
         Search and optionally delete messages from a specific folder.
-    .PARAMETER Mailbox
-        Target mailbox.
-    .PARAMETER FolderPath
-        Folder path (e.g. /Inbox, /Sent Items, /Deleted Items).
-    .PARAMETER OlderThanDays
-        Delete items older than N days.
-    .PARAMETER Subject
-        Filter by subject.
-    .PARAMETER From
-        Filter by sender.
-    .PARAMETER SizeRange
-        Filter by size: Small (<10KB), Medium (10KB-1MB), Large (1MB-10MB), VeryLarge (>10MB).
-    .PARAMETER HasAttachment
-        Filter only items with attachments.
-    .PARAMETER Action
-        Estimate or DeleteContent.
+        Uses EWS when folder is specified (Search-Mailbox doesn't support folder: keyword).
+        Falls back to Search-Mailbox for all-folders search.
     #>
     [CmdletBinding()]
     param(
@@ -833,22 +819,31 @@ function Invoke-FolderCleanup {
         [string]$SizeRange,
         [switch]$HasAttachment,
         [ValidateSet('Estimate','DeleteContent')]
-        [string]$Action = 'Estimate'
+        [string]$Action = 'Estimate',
+        [string]$Server
     )
 
+    # Build KQL query WITHOUT folder (not supported by Search-Mailbox)
     $queryParams = @{}
-    if ($FolderPath)    { $queryParams['Folder'] = $FolderPath.TrimStart('/') }
     if ($Subject)       { $queryParams['Subject'] = $Subject }
     if ($From)          { $queryParams['From'] = $From }
     if ($SizeRange)     { $queryParams['SizeRange'] = $SizeRange }
     if ($HasAttachment) { $queryParams['HasAttachment'] = $true }
-
     if ($OlderThanDays -gt 0) {
         $queryParams['EndDate'] = (Get-Date).AddDays(-$OlderThanDays)
     }
-
     $query = Build-SearchQuery @queryParams
 
+    # If a specific folder is selected, use EWS for folder-scoped operations
+    if ($FolderPath) {
+        if (-not $Server) {
+            $Server = (Get-ExchangeServer | Where-Object { $_.ServerRole -match 'Mailbox' } | Select-Object -First 1).Fqdn
+        }
+        return Invoke-FolderCleanupEWS -Mailbox $Mailbox -FolderPath $FolderPath `
+            -SearchQuery $query -Action $Action -Server $Server
+    }
+
+    # All folders — use Search-Mailbox
     $searchParams = @{
         Mailboxes   = @($Mailbox)
         SearchQuery = $query
@@ -859,6 +854,267 @@ function Invoke-FolderCleanup {
     }
 
     return Invoke-MailboxSearch @searchParams
+}
+
+function Invoke-FolderCleanupEWS {
+    <#
+    .SYNOPSIS
+        EWS-based folder search and delete. Scopes to a specific folder.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$FolderPath,
+        [string]$SearchQuery = '*',
+        [ValidateSet('Estimate','DeleteContent')]
+        [string]$Action = 'Estimate',
+        [Parameter(Mandatory)][string]$Server
+    )
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
+
+    # Map common folder paths to EWS distinguished folder IDs
+    $folderClean = $FolderPath.TrimStart('/').Trim()
+    $distinguishedMap = @{
+        'Inbox'          = 'inbox'
+        'Sent Items'     = 'sentitems'
+        'Drafts'         = 'drafts'
+        'Deleted Items'  = 'deleteditems'
+        'Junk Email'     = 'junkemail'
+        'Outbox'         = 'outbox'
+        'Notes'          = 'notes'
+        'Calendar'       = 'calendar'
+        'Contacts'       = 'contacts'
+        'Tasks'          = 'tasks'
+    }
+
+    $distinguishedId = $distinguishedMap[$folderClean]
+
+    # Build parent folder XML
+    if ($distinguishedId) {
+        $parentFolderXml = @"
+        <t:DistinguishedFolderId Id="$distinguishedId">
+          <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+"@
+    } else {
+        # Custom folder — need to find its ID first
+        $folderId = Find-EwsFolderId -Mailbox $Mailbox -FolderPath $folderClean -Server $Server
+        if (-not $folderId) {
+            throw "Folder '$folderClean' not found in mailbox $Mailbox"
+        }
+        $parentFolderXml = "<t:FolderId Id=`"$folderId`" />"
+    }
+
+    # Build query string for EWS (skip if wildcard)
+    $queryStringXml = ''
+    if ($SearchQuery -and $SearchQuery -ne '*') {
+        $queryStringXml = "<m:QueryString>$([System.Security.SecurityElement]::Escape($SearchQuery))</m:QueryString>"
+    }
+
+    # FindItem to get items in the folder
+    $soap = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:ExchangeImpersonation>
+      <t:ConnectingSID>
+        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
+      </t:ConnectingSID>
+    </t:ExchangeImpersonation>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+    <m:FindItem Traversal="Shallow">
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject" />
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+          <t:FieldURI FieldURI="item:Size" />
+          <t:FieldURI FieldURI="message:From" />
+          <t:FieldURI FieldURI="item:HasAttachments" />
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:IndexedPageItemView MaxEntriesReturned="1000" Offset="0" BasePoint="Beginning" />
+      <m:SortOrder>
+        <t:FieldOrder Order="Descending">
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+        </t:FieldOrder>
+      </m:SortOrder>
+      <m:ParentFolderIds>
+        $parentFolderXml
+      </m:ParentFolderIds>
+      $queryStringXml
+    </m:FindItem>
+  </soap:Body>
+</soap:Envelope>
+"@
+
+    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+    $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
+                    -UseDefaultCredentials -ErrorAction Stop
+    [xml]$xml = $response.Content
+    $ns = @{
+        s = 'http://schemas.xmlsoap.org/soap/envelope/'
+        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
+    }
+
+    $responseMsg = $xml.SelectSingleNode('//m:FindItemResponseMessage', $ns)
+    if (-not $responseMsg -or $responseMsg.ResponseClass -ne 'Success') {
+        $errMsg = if ($responseMsg) { $responseMsg.MessageText } else { 'EWS FindItem failed' }
+        throw $errMsg
+    }
+
+    $totalCount = 0
+    $rootFolder = $xml.SelectSingleNode('//m:RootFolder', $ns)
+    if ($rootFolder) {
+        [int]::TryParse($rootFolder.GetAttribute('TotalItemsInView'), [ref]$totalCount) | Out-Null
+    }
+
+    $items = $xml.SelectNodes('//t:Message', $ns)
+    $totalSize = 0
+    $itemIds = @()
+
+    foreach ($item in $items) {
+        $sizeNode = $item.SelectSingleNode('t:Size', $ns)
+        if ($sizeNode) {
+            $sz = 0
+            [int]::TryParse($sizeNode.InnerText, [ref]$sz) | Out-Null
+            $totalSize += $sz
+        }
+        $idNode = $item.SelectSingleNode('t:ItemId', $ns)
+        if ($idNode) {
+            $itemIds += @{ Id = $idNode.GetAttribute('Id'); ChangeKey = $idNode.GetAttribute('ChangeKey') }
+        }
+    }
+
+    if ($Action -eq 'DeleteContent' -and $itemIds.Count -gt 0) {
+        # Delete items in batches of 100
+        for ($i = 0; $i -lt $itemIds.Count; $i += 100) {
+            $batch = $itemIds[$i..[Math]::Min($i + 99, $itemIds.Count - 1)]
+            $itemIdXml = ($batch | ForEach-Object {
+                "<t:ItemId Id=`"$($_.Id)`" ChangeKey=`"$($_.ChangeKey)`" />"
+            }) -join "`n"
+
+            $deleteSoap = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:ExchangeImpersonation>
+      <t:ConnectingSID>
+        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
+      </t:ConnectingSID>
+    </t:ExchangeImpersonation>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+    <m:DeleteItem DeleteType="SoftDelete" AffectedTaskOccurrences="AllOccurrences">
+      <m:ItemIds>
+        $itemIdXml
+      </m:ItemIds>
+    </m:DeleteItem>
+  </soap:Body>
+</soap:Envelope>
+"@
+            $null = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $deleteSoap -Headers $headers `
+                        -UseDefaultCredentials -ErrorAction Stop
+        }
+    }
+
+    $sizeStr = if ($totalSize -gt 1MB) { "$([math]::Round($totalSize/1MB, 2)) MB ($totalSize bytes)" }
+               elseif ($totalSize -gt 1KB) { "$([math]::Round($totalSize/1KB, 1)) KB ($totalSize bytes)" }
+               else { "$totalSize bytes" }
+
+    return [PSCustomObject]@{
+        Mailbox       = $Mailbox
+        DisplayName   = ''
+        Success       = $true
+        ResultItems   = $totalCount
+        ResultSize    = $sizeStr
+        Action        = $Action
+        SearchQuery   = if ($SearchQuery -eq '*') { "folder:`"$folderClean`"" } else { "$SearchQuery (folder:`"$folderClean`")" }
+        TargetMailbox = ''
+        TargetFolder  = ''
+        Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    }
+}
+
+function Find-EwsFolderId {
+    <#
+    .SYNOPSIS
+        Find EWS folder ID by folder path (for custom/non-distinguished folders).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$Server
+    )
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+    $ns = @{
+        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
+    }
+
+    # Split path and walk from msgfolderroot
+    $pathParts = $FolderPath.Split('/\', [System.StringSplitOptions]::RemoveEmptyEntries)
+    $currentParent = @"
+        <t:DistinguishedFolderId Id="msgfolderroot">
+          <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+"@
+
+    foreach ($part in $pathParts) {
+        $soap = @"
+<?xml version="1.0" encoding="utf-8"?>
+<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
+               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
+               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
+  <soap:Header>
+    <t:ExchangeImpersonation>
+      <t:ConnectingSID>
+        <t:SmtpAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:SmtpAddress>
+      </t:ConnectingSID>
+    </t:ExchangeImpersonation>
+    <t:RequestServerVersion Version="Exchange2013_SP1" />
+  </soap:Header>
+  <soap:Body>
+    <m:FindFolder Traversal="Shallow">
+      <m:FolderShape><t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties><t:FieldURI FieldURI="folder:DisplayName" /></t:AdditionalProperties>
+      </m:FolderShape>
+      <m:ParentFolderIds>$currentParent</m:ParentFolderIds>
+    </m:FindFolder>
+  </soap:Body>
+</soap:Envelope>
+"@
+        $response = Invoke-WebRequest -Uri $ewsUrl -Method POST -Body $soap -Headers $headers `
+                        -UseDefaultCredentials -ErrorAction Stop
+        [xml]$xml = $response.Content
+
+        $folders = $xml.SelectNodes('//t:Folder', $ns)
+        $match = $null
+        foreach ($f in $folders) {
+            $dn = $f.SelectSingleNode('t:DisplayName', $ns)
+            if ($dn -and $dn.InnerText -eq $part) {
+                $match = $f.SelectSingleNode('t:FolderId', $ns)
+                break
+            }
+        }
+        if (-not $match) { return $null }
+        $currentParent = "<t:FolderId Id=`"$($match.GetAttribute('Id'))`" />"
+    }
+
+    return $match.GetAttribute('Id')
 }
 
 function Invoke-PurgeDeletedItems {

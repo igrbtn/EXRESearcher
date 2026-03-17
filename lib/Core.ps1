@@ -428,12 +428,21 @@ function Invoke-MailboxSearch {
         [switch]$Force
     )
 
+    # Strip KQL keywords not supported by Search-Mailbox
+    $cleanQuery = $SearchQuery
+    $cleanQuery = $cleanQuery -replace '\s*AND\s*folder:"[^"]*"', ''
+    $cleanQuery = $cleanQuery -replace 'folder:"[^"]*"\s*(AND\s*)?', ''
+    $cleanQuery = $cleanQuery -replace '\s*AND\s*hasattachment:\w+', ''
+    $cleanQuery = $cleanQuery -replace 'hasattachment:\w+\s*(AND\s*)?', ''
+    $cleanQuery = $cleanQuery.Trim()
+    if (-not $cleanQuery) { $cleanQuery = '*' }
+
     $results = @()
 
     foreach ($mbx in $Mailboxes) {
         $params = @{
             Identity    = $mbx
-            SearchQuery = $SearchQuery
+            SearchQuery = $cleanQuery
             ErrorAction = 'Stop'
         }
 
@@ -522,15 +531,18 @@ function Build-SearchQuery {
 
     $parts = @()
 
+    # Search-Mailbox supported KQL: subject, from, to, cc, bcc, participants,
+    # body, attachment, sent, received, kind, size
+    # NOT supported: messageid, folder, hasattachment
     if ($Subject)        { $parts += "subject:`"$Subject`"" }
     if ($From)           { $parts += "from:`"$From`"" }
     if ($To)             { $parts += "to:`"$To`"" }
     if ($Keywords)       { $parts += "$Keywords" }
     if ($AttachmentName) { $parts += "attachment:`"$AttachmentName`"" }
-    if ($MessageId)      { $parts += "messageid:`"$MessageId`"" }
+    if ($MessageId)      { $parts += "`"$MessageId`"" }  # free-text search (messageid: not supported)
     if ($MessageKind)    { $parts += "kind:$MessageKind" }
-    if ($Folder)         { $parts += "folder:`"$Folder`"" }
-    if ($HasAttachment)  { $parts += "hasattachment:true" }
+    if ($Folder)         { $parts += "folder:`"$Folder`"" }  # only for EWS, stripped for Search-Mailbox
+    if ($HasAttachment)  { $parts += "hasattachment:true" }  # only for EWS, stripped for Search-Mailbox
 
     if ($SizeRange) {
         switch ($SizeRange) {

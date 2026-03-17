@@ -406,6 +406,122 @@ function Get-DistributionGroupMembers {
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# EWS MESSAGE-ID SEARCH
+# ═══════════════════════════════════════════════════════════════════════════════
+
+function Find-MessageByMessageId {
+    <#
+    .SYNOPSIS
+        Find messages by Internet Message-ID header via EWS FindItem with Restriction.
+        Search-Mailbox does not support messageid: keyword — EWS is required.
+        Returns search result objects compatible with Invoke-MailboxSearch output.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$MessageId,
+        [ValidateSet('Estimate','DeleteContent')]
+        [string]$Action = 'Estimate',
+        [string]$Server
+    )
+
+    if (-not $Server) {
+        $Server = (Get-ExchangeServer | Where-Object { $_.ServerRole -match 'Mailbox' } | Select-Object -First 1).Fqdn
+    }
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+
+    # Normalize MessageId — ensure angle brackets
+    $msgId = $MessageId.Trim()
+    if (-not $msgId.StartsWith('<')) { $msgId = "<$msgId" }
+    if (-not $msgId.EndsWith('>'))   { $msgId = "$msgId>" }
+    $escapedMsgId = [System.Security.SecurityElement]::Escape($msgId)
+
+    $soapBody = @"
+    <m:FindItem Traversal="Shallow">
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject" />
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+          <t:FieldURI FieldURI="item:Size" />
+          <t:FieldURI FieldURI="message:From" />
+          <t:FieldURI FieldURI="message:InternetMessageId" />
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:IndexedPageItemView MaxEntriesReturned="50" Offset="0" BasePoint="Beginning" />
+      <m:Restriction>
+        <t:IsEqualTo>
+          <t:FieldURI FieldURI="message:InternetMessageId" />
+          <t:FieldURIOrConstant>
+            <t:Constant Value="$escapedMsgId" />
+          </t:FieldURIOrConstant>
+        </t:IsEqualTo>
+      </m:Restriction>
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="msgfolderroot">
+          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+      </m:ParentFolderIds>
+    </m:FindItem>
+"@
+
+    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
+    $ns = @{
+        m = 'http://schemas.microsoft.com/exchange/services/2006/messages'
+        t = 'http://schemas.microsoft.com/exchange/services/2006/types'
+    }
+
+    $items = $xml.SelectNodes('//t:Message', $ns)
+    $totalSize = 0
+    $itemIds = @()
+
+    foreach ($item in $items) {
+        $sizeNode = $item.SelectSingleNode('t:Size', $ns)
+        if ($sizeNode) {
+            $sz = 0; [int]::TryParse($sizeNode.InnerText, [ref]$sz) | Out-Null
+            $totalSize += $sz
+        }
+        $idNode = $item.SelectSingleNode('t:ItemId', $ns)
+        if ($idNode) {
+            $itemIds += @{ Id = $idNode.GetAttribute('Id'); ChangeKey = $idNode.GetAttribute('ChangeKey') }
+        }
+    }
+
+    if ($Action -eq 'DeleteContent' -and $itemIds.Count -gt 0) {
+        $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
+        foreach ($itemRef in $itemIds) {
+            $deleteBody = @"
+    <m:DeleteItem DeleteType="SoftDelete" AffectedTaskOccurrences="AllOccurrences">
+      <m:ItemIds>
+        <t:ItemId Id="$($itemRef.Id)" ChangeKey="$($itemRef.ChangeKey)" />
+      </m:ItemIds>
+    </m:DeleteItem>
+"@
+            $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+        }
+    }
+
+    $sizeStr = if ($totalSize -gt 1MB) { "$([math]::Round($totalSize/1MB, 2)) MB ($totalSize bytes)" }
+               elseif ($totalSize -gt 1KB) { "$([math]::Round($totalSize/1KB, 1)) KB ($totalSize bytes)" }
+               else { "$totalSize bytes" }
+
+    return [PSCustomObject]@{
+        Mailbox       = $Mailbox
+        DisplayName   = ''
+        Success       = $true
+        ResultItems   = $itemIds.Count
+        ResultSize    = $sizeStr
+        Action        = $Action
+        SearchQuery   = "messageid:`"$msgId`""
+        TargetMailbox = ''
+        TargetFolder  = ''
+        Timestamp     = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    }
+}
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # SEARCH-MAILBOX (Exchange 2019 SE native)
 # ═══════════════════════════════════════════════════════════════════════════════
 

@@ -768,16 +768,22 @@ function Show-EXRESearcherGUI {
         $targetFld = $txtTargetFolder.Text
 
         # Build command string for preview
-        $mbxList = $mailboxes -join ', '
         $cmdLines = @()
         $queryEscaped = $query -replace '"', '`"'
+        $msgIdPreview = $txtMsgId.Text.Trim()
         foreach ($m in $mailboxes) {
-            $cmd = "Search-Mailbox -Identity `"$m`" -SearchQuery `"$queryEscaped`""
-            switch ($Action) {
-                'Estimate'      { $cmd += " -EstimateResultOnly" }
-                'LogOnly'       { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`" -LogOnly" }
-                'CopyToFolder'  { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`"" }
-                'DeleteContent' { $cmd += " -DeleteContent -Force" }
+            if ($msgIdPreview) {
+                $cmd = "# EWS FindItem by InternetMessageId (Search-Mailbox doesn't support messageid:)`r`n"
+                $cmd += "# Mailbox: $m`r`n# MessageId: $msgIdPreview"
+                if ($Action -eq 'DeleteContent') { $cmd += "`r`n# Action: DELETE via EWS DeleteItem" }
+            } else {
+                $cmd = "Search-Mailbox -Identity `"$m`" -SearchQuery `"$queryEscaped`""
+                switch ($Action) {
+                    'Estimate'      { $cmd += " -EstimateResultOnly" }
+                    'LogOnly'       { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`" -LogOnly" }
+                    'CopyToFolder'  { $cmd += " -TargetMailbox `"$targetMbx`" -TargetFolder `"$targetFld`"" }
+                    'DeleteContent' { $cmd += " -DeleteContent -Force" }
+                }
             }
             $cmdLines += $cmd
         }
@@ -792,10 +798,28 @@ function Show-EXRESearcherGUI {
             if ((& $showCommandPreview -CommandText $cmdText -Title "Search-Mailbox ($Action)") -eq 'Cancel') { return }
         }
 
+        $msgIdValue = $txtMsgId.Text.Trim()
+        $serverFqdn = $txtServer.Text.Trim()
+
+        if ($msgIdValue -and $Action -in @('LogOnly','CopyToFolder')) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "MessageId search only supports Estimate and Delete.`nLog/Copy are not available for MessageId lookup.",
+                'MessageId Search', 'OK', 'Information')
+            return
+        }
+
         Update-StatusBar "Searching ($Action)..."
 
         Start-AsyncJob -Name "Search ($Action)" -Form $form -ScriptBlock {
-            param($Mailboxes, $SearchQuery, $Action, $TargetMailbox, $TargetFolder)
+            param($Mailboxes, $SearchQuery, $Action, $TargetMailbox, $TargetFolder, $MessageId, $Server)
+            if ($MessageId) {
+                # MessageId search via EWS (Search-Mailbox doesn't support messageid:)
+                $results = @()
+                foreach ($mbx in $Mailboxes) {
+                    $results += Find-MessageByMessageId -Mailbox $mbx -MessageId $MessageId -Action $Action -Server $Server
+                }
+                return $results
+            }
             $params = @{
                 Mailboxes   = $Mailboxes
                 SearchQuery = $SearchQuery
@@ -815,6 +839,8 @@ function Show-EXRESearcherGUI {
             Action        = $Action
             TargetMailbox = $targetMbx
             TargetFolder  = $targetFld
+            MessageId     = $msgIdValue
+            Server        = $serverFqdn
         } -OnComplete {
             param($result)
             try {

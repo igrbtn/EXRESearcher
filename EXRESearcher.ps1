@@ -558,17 +558,6 @@ function Show-EXRESearcherGUI {
         $btnCopy.Add_Click({
             [System.Windows.Forms.Clipboard]::SetText($txt.Text)
             $btnCopy.Text = 'Copied!'
-            $script:_copyTimer = New-Object System.Windows.Forms.Timer
-            $script:_copyTimer.Interval = 1500
-            $script:_copyTimer.Tag = $btnCopy
-            $script:_copyTimer.Add_Tick({
-                $this = $script:_copyTimer
-                $this.Tag.Text = 'Copy'
-                $this.Stop()
-                $this.Dispose()
-                $script:_copyTimer = $null
-            })
-            $script:_copyTimer.Start()
         })
 
         $btnWhatIf = New-Btn -Text 'WhatIf' -W 90 -Color 'Orange'

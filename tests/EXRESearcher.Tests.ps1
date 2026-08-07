@@ -46,9 +46,9 @@ Describe 'Build-SearchQuery' {
         $result | Should -Be 'attachment:"report.xlsx"'
     }
 
-    It 'builds messageid filter' {
+    It 'adds messageid as quoted free-text (messageid: keyword unsupported by Search-Mailbox)' {
         $result = Build-SearchQuery -MessageId '<abc@domain.com>'
-        $result | Should -Match 'messageid:'
+        $result | Should -Be '"<abc@domain.com>"'
     }
 
     It 'builds keywords' {
@@ -65,10 +65,36 @@ Describe 'Build-SearchQuery' {
     }
 }
 
+Describe 'ConvertTo-SearchMailboxQuery' {
+    It 'strips trailing folder: clause' {
+        ConvertTo-SearchMailboxQuery -Query 'subject:"x" AND folder:"Inbox"' | Should -Be 'subject:"x"'
+    }
+
+    It 'strips leading hasattachment: clause' {
+        ConvertTo-SearchMailboxQuery -Query 'hasattachment:true AND subject:"x"' | Should -Be 'subject:"x"'
+    }
+
+    It 'returns wildcard when the whole query is unsupported' {
+        ConvertTo-SearchMailboxQuery -Query 'folder:"Inbox"' | Should -Be '*'
+    }
+
+    It 'keeps supported query untouched' {
+        ConvertTo-SearchMailboxQuery -Query 'subject:"x" AND from:"a@b.com"' | Should -Be 'subject:"x" AND from:"a@b.com"'
+    }
+}
+
 Describe 'Settings Functions' {
     It 'Get-AppSettings returns object with expected properties' {
         $settings = Get-AppSettings
         $settings | Should -Not -BeNullOrEmpty
+        $settings.ContainsKey('LastServer') | Should -Be $true
+        $settings.ContainsKey('RecentServers') | Should -Be $true
+    }
+
+    It 'Get-AppSettings returns a hashtable that accepts new keys (old settings.json compat)' {
+        $settings = Get-AppSettings
+        $settings | Should -BeOfType [hashtable]
+        { $settings['BrandNewKey'] = 1 } | Should -Not -Throw
     }
 
     It 'Initialize-AppData creates directory' {
@@ -111,7 +137,7 @@ Describe 'Write-SearchLog' {
     }
 }
 
-Describe 'GUI Function Existence' {
+Describe 'GUI Function Existence' -Skip:($env:OS -ne 'Windows_NT') {
     BeforeAll {
         # Load main script as dot-source (won't launch GUI due to InvocationName check)
         . "$scriptRoot/EXRESearcher.ps1"
@@ -119,5 +145,9 @@ Describe 'GUI Function Existence' {
 
     It 'Show-EXRESearcherGUI function exists' {
         Get-Command Show-EXRESearcherGUI -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
+    }
+
+    It 'Start-WhatIfJob function exists' {
+        Get-Command Start-WhatIfJob -ErrorAction SilentlyContinue | Should -Not -BeNullOrEmpty
     }
 }

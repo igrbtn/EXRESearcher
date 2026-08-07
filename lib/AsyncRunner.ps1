@@ -35,26 +35,36 @@ function Start-AsyncJob {
     $runspace.ThreadOptions = 'ReuseThread'
     $runspace.Open()
 
-    # Import functions from lib files into runspace
-    $scriptRoot = $PSScriptRoot
+    # Import functions from lib files into runspace.
+    # Runs INSIDE BeginInvoke (snap-in / remote session import take seconds
+    # and must not block the UI thread).
+    $scriptRoot = $PSScriptRoot -replace "'", "''"
+    $wd = $PWD.Path -replace "'", "''"
     $initScript = @"
-Set-Location '$($PWD.Path)'
+Set-Location -LiteralPath '$wd'
 Add-PSSnapin Microsoft.Exchange.Management.PowerShell.SnapIn -ErrorAction SilentlyContinue
 . '$scriptRoot/Core.ps1'
 . '$scriptRoot/Settings.ps1'
 "@
 
+    # Remote mode: Import-PSSession proxies live per-runspace, so each job
+    # imports its own session (removed again in Update-AsyncJobs cleanup)
+    if ($script:Session -and -not $script:Session.IsEMS -and $script:Session.Server) {
+        $srv = $script:Session.Server
+        $initScript += @"
+
+if (-not (Get-Command Search-Mailbox -ErrorAction SilentlyContinue)) {
+    `$exreRemote = New-PSSession -ConfigurationName 'Microsoft.Exchange' -ConnectionUri 'http://$srv/PowerShell/' -Authentication Kerberos -ErrorAction Stop
+    Import-PSSession -Session `$exreRemote -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+}
+"@
+    }
+
     $ps = [powershell]::Create()
     $ps.Runspace = $runspace
 
-    # First run init script to load functions
     [void]$ps.AddScript($initScript)
-    try { [void]$ps.Invoke() } catch {}
-    $ps.Commands.Clear()
-    $ps.Streams.Error.Clear()
-
-    # Now add the actual work
-    [void]$ps.AddScript($ScriptBlock)
+    [void]$ps.AddStatement().AddScript($ScriptBlock)
     foreach ($key in $Parameters.Keys) {
         [void]$ps.AddParameter($key, $Parameters[$key])
     }
@@ -113,7 +123,11 @@ function Update-AsyncJobs {
                 $job.EndTime = Get-Date
                 $job.Duration = ($job.EndTime - $job.StartTime)
 
-                if ($errors.Count -gt 0) {
+                # Non-terminating errors with output = partial success:
+                # deliver the result, surface errors as warnings.
+                $hasOutput = ($null -ne $result -and $result.Count -gt 0)
+
+                if ($errors.Count -gt 0 -and -not $hasOutput) {
                     $job.Status = 'Failed'
                     $job.Error = ($errors | ForEach-Object { $_.ToString() }) -join '; '
 
@@ -137,6 +151,10 @@ function Update-AsyncJobs {
                     $dur = [math]::Round($job.Duration.TotalSeconds, 1)
                     if ($script:JobConsole) {
                         $script:JobConsole.AppendText("[$ts] DONE   #$($job.Id) $($job.Name) (${dur}s)`r`n")
+                        if ($errors.Count -gt 0) {
+                            $firstErr = $errors[0].ToString()
+                            $script:JobConsole.AppendText("[$ts] WARN   #$($job.Id) $($job.Name): $($errors.Count) non-terminating error(s), first: $firstErr`r`n")
+                        }
                         $script:JobConsole.ScrollToCaret()
                     }
 
@@ -162,6 +180,14 @@ function Update-AsyncJobs {
                 }
             }
             finally {
+                # Close any remote PSSession the job imported (server-side
+                # WSMan shells would otherwise linger until idle timeout)
+                try {
+                    $job.PowerShell.Commands.Clear()
+                    [void]$job.PowerShell.AddScript('Get-PSSession -ErrorAction SilentlyContinue | Remove-PSSession -ErrorAction SilentlyContinue')
+                    [void]$job.PowerShell.Invoke()
+                } catch {}
+
                 # Cleanup runspace
                 try {
                     $job.PowerShell.Dispose()

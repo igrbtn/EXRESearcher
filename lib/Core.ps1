@@ -121,10 +121,60 @@ function New-EwsNamespaceManager {
     return $nsMgr
 }
 
+function Initialize-EwsCertPolicy {
+    <#
+    .SYNOPSIS
+        Install a compiled certificate validation callback (a PowerShell
+        scriptblock callback crashes on non-PS threads with "no Runspace").
+        Valid certs always pass; invalid ones pass only while TrustAllCerts
+        is enabled (default; set EXRE_STRICT_TLS=1 to enforce validation).
+    #>
+    if (-not ('EXRESearcher.CertPolicy' -as [type])) {
+        Add-Type -TypeDefinition @"
+using System;
+using System.Net;
+using System.Net.Security;
+using System.Security.Cryptography.X509Certificates;
+namespace EXRESearcher {
+    public static class CertPolicy {
+        public static bool TrustAllCerts = true;
+        public static void Install() {
+            ServicePointManager.ServerCertificateValidationCallback = Validate;
+        }
+        private static bool Validate(object sender, X509Certificate cert, X509Chain chain, SslPolicyErrors errors) {
+            if (errors == SslPolicyErrors.None) { return true; }
+            return TrustAllCerts;
+        }
+    }
+}
+"@
+    }
+    [EXRESearcher.CertPolicy]::TrustAllCerts = ($env:EXRE_STRICT_TLS -ne '1')
+    [EXRESearcher.CertPolicy]::Install()
+}
+
+# Well-known folder paths -> EWS distinguished folder IDs
+$script:EwsWellKnownFolders = @{
+    'Inbox'          = 'inbox'
+    'Sent Items'     = 'sentitems'
+    'Drafts'         = 'drafts'
+    'Deleted Items'  = 'deleteditems'
+    'Junk Email'     = 'junkemail'
+    'Outbox'         = 'outbox'
+    'Notes'          = 'notes'
+    'Calendar'       = 'calendar'
+    'Contacts'       = 'contacts'
+    'Tasks'          = 'tasks'
+}
+
 function Invoke-EwsRequest {
     <#
     .SYNOPSIS
-        Send EWS SOAP request. Tries without impersonation first, then with.
+        Send EWS SOAP request.
+        With -Mailbox: tries a plain request first (the SOAP body must reference
+        the target mailbox explicitly - Full Access path), then Exchange
+        impersonation. Without -Mailbox: single plain request (caller's own
+        mailbox). Never silently retargets another mailbox.
         Returns [xml] response.
     #>
     [CmdletBinding()]
@@ -134,13 +184,13 @@ function Invoke-EwsRequest {
         [string]$Mailbox
     )
 
-    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
+    try { Initialize-EwsCertPolicy } catch {}
     $headers = @{ 'Content-Type' = 'text/xml; charset=utf-8' }
 
     $escapedMailbox = if ($Mailbox) { [System.Security.SecurityElement]::Escape($Mailbox) } else { '' }
 
-    # SOAP without impersonation
-    $soap1 = @"
+    # Plain request (works for own mailbox and Full Access on target mailbox)
+    $soapPlain = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
@@ -154,8 +204,8 @@ $SoapBody
 </soap:Envelope>
 "@
 
-    # SOAP with impersonation
-    $soap2 = @"
+    # Impersonation request (requires ApplicationImpersonation role)
+    $soapImpersonate = @"
 <?xml version="1.0" encoding="utf-8"?>
 <soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
                xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
@@ -174,29 +224,13 @@ $SoapBody
 </soap:Envelope>
 "@
 
-    # Also build a variant without Mailbox element (for own mailbox access)
-    $soapBodyNoMbx = $SoapBody -replace '<t:Mailbox>\s*<t:EmailAddress>[^<]*</t:EmailAddress>\s*</t:Mailbox>', ''
-    $soap0 = @"
-<?xml version="1.0" encoding="utf-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:t="http://schemas.microsoft.com/exchange/services/2006/types"
-               xmlns:m="http://schemas.microsoft.com/exchange/services/2006/messages">
-  <soap:Header>
-    <t:RequestServerVersion Version="Exchange2013_SP1" />
-  </soap:Header>
-  <soap:Body>
-$soapBodyNoMbx
-  </soap:Body>
-</soap:Envelope>
-"@
-
+    $variants = if ($Mailbox) { @($soapPlain, $soapImpersonate) } else { @($soapPlain) }
     $lastError = ''
 
-    # Try: 1) own mailbox, 2) with Mailbox element (Full Access), 3) with impersonation
-    foreach ($soap in @($soap0, $soap1, $soap2)) {
+    foreach ($soap in $variants) {
         try {
             $response = Invoke-WebRequest -Uri $EwsUrl -Method POST -Body $soap -Headers $headers `
-                            -UseDefaultCredentials -ErrorAction Stop
+                            -UseDefaultCredentials -UseBasicParsing -ErrorAction Stop
             [xml]$xml = $response.Content
             $nsMgr = New-EwsNamespaceManager -Xml $xml
 
@@ -204,17 +238,19 @@ $soapBodyNoMbx
             $fault = $xml.SelectSingleNode('//s:Fault/faultstring', $nsMgr)
             if ($fault) { $lastError = $fault.InnerText; continue }
 
-            # Check for error response
+            # Multi-folder requests return one response message per folder;
+            # fail over only when there is no successful response at all.
             $respMsg = $xml.SelectNodes('//*[@ResponseClass]', $nsMgr)
-            $hasError = $false
+            $successCount = 0
+            $errorText = ''
             foreach ($r in $respMsg) {
                 if ($r.ResponseClass -eq 'Error') {
-                    $lastError = $r.MessageText
-                    $hasError = $true
-                    break
+                    if (-not $errorText) { $errorText = $r.MessageText }
+                } else {
+                    $successCount++
                 }
             }
-            if ($hasError) { continue }
+            if ($errorText -and $successCount -eq 0) { $lastError = $errorText; continue }
 
             return $xml
         } catch {
@@ -223,6 +259,199 @@ $soapBodyNoMbx
     }
 
     throw "EWS request failed: $lastError"
+}
+
+function Get-EwsMailboxFolderIds {
+    <#
+    .SYNOPSIS
+        Enumerate all folder IDs of a mailbox (FindFolder Deep from msgfolderroot).
+        FindItem does not support Deep traversal, so whole-mailbox item searches
+        must pass an explicit folder list as ParentFolderIds.
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$Server,
+        [int]$MaxFolders = 1000
+    )
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+
+    $soapBody = @"
+    <m:FindFolder Traversal="Deep">
+      <m:FolderShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+      </m:FolderShape>
+      <m:IndexedPageFolderView MaxEntriesReturned="$MaxFolders" Offset="0" BasePoint="Beginning" />
+      <m:ParentFolderIds>
+        <t:DistinguishedFolderId Id="msgfolderroot">
+          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+      </m:ParentFolderIds>
+    </m:FindFolder>
+"@
+
+    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
+    $ns = New-EwsNamespaceManager -Xml $xml
+
+    $ids = @()
+    foreach ($node in $xml.SelectNodes('//t:Folder/t:FolderId', $ns)) {
+        $ids += $node.GetAttribute('Id')
+    }
+    return $ids
+}
+
+function Get-EwsParentFolderXml {
+    <#
+    .SYNOPSIS
+        Build ParentFolderIds inner XML covering the whole mailbox.
+        Falls back to well-known folders if folder enumeration fails.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$Server
+    )
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+    $folderIds = @()
+    try { $folderIds = @(Get-EwsMailboxFolderIds -Mailbox $Mailbox -Server $Server) } catch {}
+    if ($folderIds.Count -gt 0) {
+        return ($folderIds | ForEach-Object { "<t:FolderId Id=`"$_`" />" }) -join "`n        "
+    }
+    return (@('inbox', 'sentitems', 'deleteditems', 'junkemail', 'drafts') | ForEach-Object {
+        "<t:DistinguishedFolderId Id=`"$_`"><t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox></t:DistinguishedFolderId>"
+    }) -join "`n        "
+}
+
+function Get-EwsFolderXml {
+    <#
+    .SYNOPSIS
+        Resolve a folder path to ParentFolderIds inner XML for a single folder.
+        Throws if the folder cannot be found.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$FolderPath,
+        [Parameter(Mandatory)][string]$Server
+    )
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+    $folderClean = $FolderPath.TrimStart('/').Trim()
+    $distinguishedId = $script:EwsWellKnownFolders[$folderClean]
+    if ($distinguishedId) {
+        return @"
+<t:DistinguishedFolderId Id="$distinguishedId">
+          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+"@
+    }
+    $folderId = Find-EwsFolderId -Mailbox $Mailbox -FolderPath $folderClean -Server $Server
+    if (-not $folderId) {
+        throw "Folder '$folderClean' not found in mailbox $Mailbox"
+    }
+    return "<t:FolderId Id=`"$folderId`" />"
+}
+
+function Get-EwsFolderMessages {
+    <#
+    .SYNOPSIS
+        Paged EWS FindItem over the given parent folder(s).
+        Returns @{ Items = <Id/ChangeKey/Subject/From/Received/Size objects>; Total = <int> }.
+        RestrictionXml and QueryStringXml are mutually exclusive (EWS limitation).
+        Paging works only for a single parent folder; multi-folder requests
+        return the first page per folder (EWS pages per-folder).
+    #>
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$Mailbox,
+        [Parameter(Mandatory)][string]$Server,
+        [Parameter(Mandatory)][string]$ParentFolderXml,
+        [string]$RestrictionXml = '',
+        [string]$QueryStringXml = '',
+        [int]$MaxItems = 50000
+    )
+
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $items = @()
+    $total = 0
+    $offset = 0
+
+    while ($true) {
+        $pageSize = [Math]::Min(1000, $MaxItems - $items.Count)
+        if ($pageSize -le 0) { break }
+
+        $soapBody = @"
+    <m:FindItem Traversal="Shallow">
+      <m:ItemShape>
+        <t:BaseShape>IdOnly</t:BaseShape>
+        <t:AdditionalProperties>
+          <t:FieldURI FieldURI="item:Subject" />
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+          <t:FieldURI FieldURI="item:Size" />
+          <t:FieldURI FieldURI="message:From" />
+        </t:AdditionalProperties>
+      </m:ItemShape>
+      <m:IndexedPageItemView MaxEntriesReturned="$pageSize" Offset="$offset" BasePoint="Beginning" />
+      $RestrictionXml
+      <m:SortOrder>
+        <t:FieldOrder Order="Descending">
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+        </t:FieldOrder>
+      </m:SortOrder>
+      <m:ParentFolderIds>
+        $ParentFolderXml
+      </m:ParentFolderIds>
+      $QueryStringXml
+    </m:FindItem>
+"@
+
+        $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
+        $ns = New-EwsNamespaceManager -Xml $xml
+
+        $roots = $xml.SelectNodes('//m:RootFolder', $ns)
+        if ($roots.Count -eq 0) { break }
+
+        if ($offset -eq 0) {
+            foreach ($root in $roots) {
+                $t = 0
+                if ([int]::TryParse($root.GetAttribute('TotalItemsInView'), [ref]$t)) { $total += $t }
+            }
+        }
+
+        $pageNodes = $xml.SelectNodes('//t:Items/*', $ns)
+        foreach ($node in $pageNodes) {
+            $idNode = $node.SelectSingleNode('t:ItemId', $ns)
+            if (-not $idNode) { continue }
+            $sz = 0
+            $sizeNode = $node.SelectSingleNode('t:Size', $ns)
+            if ($sizeNode) { [int]::TryParse($sizeNode.InnerText, [ref]$sz) | Out-Null }
+            $subjNode = $node.SelectSingleNode('t:Subject', $ns)
+            $recvNode = $node.SelectSingleNode('t:DateTimeReceived', $ns)
+            $fromNode = $node.SelectSingleNode('t:From/t:Mailbox/t:EmailAddress', $ns)
+            if (-not $fromNode) { $fromNode = $node.SelectSingleNode('t:From/t:Mailbox/t:Name', $ns) }
+            $items += [PSCustomObject]@{
+                Id        = $idNode.GetAttribute('Id')
+                ChangeKey = $idNode.GetAttribute('ChangeKey')
+                Subject   = if ($subjNode) { $subjNode.InnerText } else { '' }
+                From      = if ($fromNode) { $fromNode.InnerText } else { '' }
+                Received  = if ($recvNode) { $recvNode.InnerText } else { '' }
+                Size      = $sz
+            }
+        }
+
+        # Stop conditions: all folders exhausted, multi-folder (no shared offset), empty page
+        $allLast = $true
+        foreach ($root in $roots) {
+            if ($root.GetAttribute('IncludesLastItemInRange') -ne 'true') { $allLast = $false }
+        }
+        if ($allLast -or $roots.Count -gt 1 -or $pageNodes.Count -eq 0) { break }
+
+        $newOffset = 0
+        [int]::TryParse($roots[0].GetAttribute('IndexedPagingOffset'), [ref]$newOffset) | Out-Null
+        if ($newOffset -le $offset) { break }
+        $offset = $newOffset
+    }
+
+    return @{ Items = $items; Total = [Math]::Max($total, $items.Count) }
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -249,8 +478,11 @@ function Get-MailboxMessagePreview {
     }
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
-    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
     $escapedQuery = [System.Security.SecurityElement]::Escape($SearchQuery)
+
+    # FindItem cannot traverse Deep; search all folders explicitly
+    # (Shallow on msgfolderroot alone would only see items directly in the root)
+    $parentFolderXml = Get-EwsParentFolderXml -Mailbox $Mailbox -Server $Server
 
     $soapBody = @"
     <m:FindItem Traversal="Shallow">
@@ -274,9 +506,7 @@ function Get-MailboxMessagePreview {
         </t:FieldOrder>
       </m:SortOrder>
       <m:ParentFolderIds>
-        <t:DistinguishedFolderId Id="msgfolderroot">
-          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
-        </t:DistinguishedFolderId>
+        $parentFolderXml
       </m:ParentFolderIds>
       <m:QueryString>$escapedQuery</m:QueryString>
     </m:FindItem>
@@ -321,7 +551,8 @@ function Get-MailboxMessagePreview {
         }
     }
 
-    return $results
+    # MaxEntriesReturned applies per folder; cap the combined result set
+    return @($results | Sort-Object Received -Descending | Select-Object -First $MaxResults)
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -439,27 +670,16 @@ function Find-MessageByMessageId {
     }
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
-    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
 
-    # Normalize MessageId — ensure angle brackets
+    # Normalize MessageId - ensure angle brackets
     $msgId = $MessageId.Trim()
     if (-not $msgId.StartsWith('<')) { $msgId = "<$msgId" }
     if (-not $msgId.EndsWith('>'))   { $msgId = "$msgId>" }
     $escapedMsgId = [System.Security.SecurityElement]::Escape($msgId)
 
-    $soapBody = @"
-    <m:FindItem Traversal="Shallow">
-      <m:ItemShape>
-        <t:BaseShape>IdOnly</t:BaseShape>
-        <t:AdditionalProperties>
-          <t:FieldURI FieldURI="item:Subject" />
-          <t:FieldURI FieldURI="item:DateTimeReceived" />
-          <t:FieldURI FieldURI="item:Size" />
-          <t:FieldURI FieldURI="message:From" />
-          <t:FieldURI FieldURI="message:InternetMessageId" />
-        </t:AdditionalProperties>
-      </m:ItemShape>
-      <m:IndexedPageItemView MaxEntriesReturned="50" Offset="0" BasePoint="Beginning" />
+    # Search every folder: FindItem has no Deep traversal
+    $parentFolderXml = Get-EwsParentFolderXml -Mailbox $Mailbox -Server $Server
+    $restrictionXml = @"
       <m:Restriction>
         <t:IsEqualTo>
           <t:FieldURI FieldURI="message:InternetMessageId" />
@@ -468,35 +688,16 @@ function Find-MessageByMessageId {
           </t:FieldURIOrConstant>
         </t:IsEqualTo>
       </m:Restriction>
-      <m:ParentFolderIds>
-        <t:DistinguishedFolderId Id="msgfolderroot">
-          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
-        </t:DistinguishedFolderId>
-      </m:ParentFolderIds>
-    </m:FindItem>
 "@
 
-    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
-    $ns = New-EwsNamespaceManager -Xml $xml
+    $found = Get-EwsFolderMessages -Mailbox $Mailbox -Server $Server `
+                -ParentFolderXml $parentFolderXml -RestrictionXml $restrictionXml -MaxItems 100
+    $itemIds = @($found.Items)
+    $totalSize = ($itemIds | Measure-Object -Property Size -Sum).Sum
+    if (-not $totalSize) { $totalSize = 0 }
 
-    $items = $xml.SelectNodes('//t:Message', $ns)
-    $totalSize = 0
-    $itemIds = @()
-
-    foreach ($item in $items) {
-        $sizeNode = $item.SelectSingleNode('t:Size', $ns)
-        if ($sizeNode) {
-            $sz = 0; [int]::TryParse($sizeNode.InnerText, [ref]$sz) | Out-Null
-            $totalSize += $sz
-        }
-        $idNode = $item.SelectSingleNode('t:ItemId', $ns)
-        if ($idNode) {
-            $itemIds += @{ Id = $idNode.GetAttribute('Id'); ChangeKey = $idNode.GetAttribute('ChangeKey') }
-        }
-    }
-
+    $deleted = 0
     if ($Action -eq 'DeleteContent' -and $itemIds.Count -gt 0) {
-        $deleted = 0
         foreach ($itemRef in $itemIds) {
             try {
                 $deleteBody = @"
@@ -522,7 +723,7 @@ function Find-MessageByMessageId {
         Mailbox       = $Mailbox
         DisplayName   = ''
         Success       = $true
-        ResultItems   = $itemIds.Count
+        ResultItems   = if ($Action -eq 'DeleteContent') { $deleted } else { $itemIds.Count }
         ResultSize    = $sizeStr
         Action        = $Action
         SearchQuery   = "messageid:`"$msgId`""
@@ -535,6 +736,24 @@ function Find-MessageByMessageId {
 # ═══════════════════════════════════════════════════════════════════════════════
 # SEARCH-MAILBOX (Exchange 2019 SE native)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+function ConvertTo-SearchMailboxQuery {
+    <#
+    .SYNOPSIS
+        Strip KQL keywords not supported by Search-Mailbox (folder:, hasattachment:).
+    #>
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Query)
+
+    $clean = $Query
+    $clean = $clean -replace '\s*AND\s*folder:"[^"]*"', ''
+    $clean = $clean -replace 'folder:"[^"]*"\s*(AND\s*)?', ''
+    $clean = $clean -replace '\s*AND\s*hasattachment:\w+', ''
+    $clean = $clean -replace 'hasattachment:\w+\s*(AND\s*)?', ''
+    $clean = $clean.Trim()
+    if (-not $clean) { return '*' }
+    return $clean
+}
 
 function Invoke-MailboxSearch {
     <#
@@ -555,14 +774,7 @@ function Invoke-MailboxSearch {
         [switch]$Force
     )
 
-    # Strip KQL keywords not supported by Search-Mailbox
-    $cleanQuery = $SearchQuery
-    $cleanQuery = $cleanQuery -replace '\s*AND\s*folder:"[^"]*"', ''
-    $cleanQuery = $cleanQuery -replace 'folder:"[^"]*"\s*(AND\s*)?', ''
-    $cleanQuery = $cleanQuery -replace '\s*AND\s*hasattachment:\w+', ''
-    $cleanQuery = $cleanQuery -replace 'hasattachment:\w+\s*(AND\s*)?', ''
-    $cleanQuery = $cleanQuery.Trim()
-    if (-not $cleanQuery) { $cleanQuery = '*' }
+    $cleanQuery = ConvertTo-SearchMailboxQuery -Query $SearchQuery
 
     $results = @()
 
@@ -855,36 +1067,6 @@ function Stop-ContentSearch {
 # ORGANIZATION-WIDE OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
 
-function Search-AllMailboxes {
-    <#
-    .SYNOPSIS
-        Search across ALL mailboxes in the organization.
-        Returns estimate results per mailbox.
-    #>
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$SearchQuery,
-        [int]$BatchSize = 50
-    )
-
-    $allMailboxes = Get-Mailbox -ResultSize Unlimited -ErrorAction Stop |
-                    Where-Object { $_.RecipientTypeDetails -eq 'UserMailbox' } |
-                    ForEach-Object { $_.PrimarySmtpAddress }
-
-    $totalResults = @()
-    $batches = [math]::Ceiling($allMailboxes.Count / $BatchSize)
-
-    for ($i = 0; $i -lt $batches; $i++) {
-        $start = $i * $BatchSize
-        $batch = $allMailboxes[$start..([math]::Min($start + $BatchSize - 1, $allMailboxes.Count - 1))]
-
-        $batchResults = Invoke-MailboxSearch -Mailboxes $batch -SearchQuery $SearchQuery -Action 'Estimate'
-        $totalResults += $batchResults | Where-Object { $_.ResultItems -gt 0 }
-    }
-
-    return $totalResults | Sort-Object { [int]$_.ResultItems } -Descending
-}
-
 function Remove-MessageFromOrganization {
     <#
     .SYNOPSIS
@@ -1096,40 +1278,9 @@ function Invoke-FolderCleanupEWS {
     )
 
     $ewsUrl = "https://$Server/EWS/Exchange.asmx"
-    try { [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true } } catch {}
-
-    # Map common folder paths to EWS distinguished folder IDs
     $folderClean = $FolderPath.TrimStart('/').Trim()
-    $distinguishedMap = @{
-        'Inbox'          = 'inbox'
-        'Sent Items'     = 'sentitems'
-        'Drafts'         = 'drafts'
-        'Deleted Items'  = 'deleteditems'
-        'Junk Email'     = 'junkemail'
-        'Outbox'         = 'outbox'
-        'Notes'          = 'notes'
-        'Calendar'       = 'calendar'
-        'Contacts'       = 'contacts'
-        'Tasks'          = 'tasks'
-    }
 
-    $distinguishedId = $distinguishedMap[$folderClean]
-
-    # Build parent folder XML
-    if ($distinguishedId) {
-        $parentFolderXml = @"
-        <t:DistinguishedFolderId Id="$distinguishedId">
-          <t:Mailbox><t:EmailAddress>$([System.Security.SecurityElement]::Escape($Mailbox))</t:EmailAddress></t:Mailbox>
-        </t:DistinguishedFolderId>
-"@
-    } else {
-        # Custom folder — need to find its ID first
-        $folderId = Find-EwsFolderId -Mailbox $Mailbox -FolderPath $folderClean -Server $Server
-        if (-not $folderId) {
-            throw "Folder '$folderClean' not found in mailbox $Mailbox"
-        }
-        $parentFolderXml = "<t:FolderId Id=`"$folderId`" />"
-    }
+    $parentFolderXml = Get-EwsFolderXml -Mailbox $Mailbox -FolderPath $folderClean -Server $Server
 
     # Build query string for EWS (skip if wildcard)
     $queryStringXml = ''
@@ -1137,62 +1288,19 @@ function Invoke-FolderCleanupEWS {
         $queryStringXml = "<m:QueryString>$([System.Security.SecurityElement]::Escape($SearchQuery))</m:QueryString>"
     }
 
-    # FindItem to get items in the folder
-    $soapBody = @"
-    <m:FindItem Traversal="Shallow">
-      <m:ItemShape>
-        <t:BaseShape>IdOnly</t:BaseShape>
-        <t:AdditionalProperties>
-          <t:FieldURI FieldURI="item:Subject" />
-          <t:FieldURI FieldURI="item:DateTimeReceived" />
-          <t:FieldURI FieldURI="item:Size" />
-          <t:FieldURI FieldURI="message:From" />
-          <t:FieldURI FieldURI="item:HasAttachments" />
-        </t:AdditionalProperties>
-      </m:ItemShape>
-      <m:IndexedPageItemView MaxEntriesReturned="1000" Offset="0" BasePoint="Beginning" />
-      <m:SortOrder>
-        <t:FieldOrder Order="Descending">
-          <t:FieldURI FieldURI="item:DateTimeReceived" />
-        </t:FieldOrder>
-      </m:SortOrder>
-      <m:ParentFolderIds>
-        $parentFolderXml
-      </m:ParentFolderIds>
-      $queryStringXml
-    </m:FindItem>
-"@
+    # Paged FindItem: collects ALL matching item ids, not just the first page
+    $found = Get-EwsFolderMessages -Mailbox $Mailbox -Server $Server `
+                -ParentFolderXml $parentFolderXml -QueryStringXml $queryStringXml
+    $itemIds = @($found.Items)
+    $totalCount = $found.Total
+    $totalSize = ($itemIds | Measure-Object -Property Size -Sum).Sum
+    if (-not $totalSize) { $totalSize = 0 }
 
-    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $soapBody -Mailbox $Mailbox
-    $ns = New-EwsNamespaceManager -Xml $xml
-
-    $totalCount = 0
-    $rootFolder = $xml.SelectSingleNode('//m:RootFolder', $ns)
-    if ($rootFolder) {
-        [int]::TryParse($rootFolder.GetAttribute('TotalItemsInView'), [ref]$totalCount) | Out-Null
-    }
-
-    $items = $xml.SelectNodes('//t:Message', $ns)
-    $totalSize = 0
-    $itemIds = @()
-
-    foreach ($item in $items) {
-        $sizeNode = $item.SelectSingleNode('t:Size', $ns)
-        if ($sizeNode) {
-            $sz = 0
-            [int]::TryParse($sizeNode.InnerText, [ref]$sz) | Out-Null
-            $totalSize += $sz
-        }
-        $idNode = $item.SelectSingleNode('t:ItemId', $ns)
-        if ($idNode) {
-            $itemIds += @{ Id = $idNode.GetAttribute('Id'); ChangeKey = $idNode.GetAttribute('ChangeKey') }
-        }
-    }
-
+    $deleted = 0
     if ($Action -eq 'DeleteContent' -and $itemIds.Count -gt 0) {
         # Delete items in batches of 100
         for ($i = 0; $i -lt $itemIds.Count; $i += 100) {
-            $batch = $itemIds[$i..[Math]::Min($i + 99, $itemIds.Count - 1)]
+            $batch = @($itemIds[$i..([Math]::Min($i + 99, $itemIds.Count - 1))])
             $itemIdXml = ($batch | ForEach-Object {
                 "<t:ItemId Id=`"$($_.Id)`" ChangeKey=`"$($_.ChangeKey)`" />"
             }) -join "`n"
@@ -1206,6 +1314,7 @@ function Invoke-FolderCleanupEWS {
     </m:DeleteItem>
 "@
                 $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $deleteBody -Mailbox $Mailbox
+                $deleted += $batch.Count
             } catch {
                 Write-Warning "Batch delete failed: $_"
             }
@@ -1220,7 +1329,7 @@ function Invoke-FolderCleanupEWS {
         Mailbox       = $Mailbox
         DisplayName   = ''
         Success       = $true
-        ResultItems   = $totalCount
+        ResultItems   = if ($Action -eq 'DeleteContent') { $deleted } else { $totalCount }
         ResultSize    = $sizeStr
         Action        = $Action
         SearchQuery   = if ($SearchQuery -eq '*') { "folder:`"$folderClean`"" } else { "$SearchQuery (folder:`"$folderClean`")" }
@@ -1341,67 +1450,81 @@ function Invoke-PurgeDeletedItems {
 function Find-MailboxDuplicates {
     <#
     .SYNOPSIS
-        Find potential duplicate messages in a mailbox.
-        Strategy: search by subject+sender combinations and identify
-        messages that appear multiple times (same subject, same sender, same day).
-    .DESCRIPTION
-        1. Gets folder statistics to identify folders with many items.
-        2. For each target folder, uses Search-Mailbox to export to discovery mailbox.
-        3. Analyzes results by grouping on subject+from+date.
-
-        Simplified approach: searches for exact subject matches and returns
-        folders/counts where duplicates are likely.
+        Find duplicate messages in a mailbox via EWS.
+        A duplicate = same Subject + From + received date within one folder.
+        (Search-Mailbox cannot scope to a folder, so EWS is used.)
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Mailbox,
         [string]$FolderPath,
-        [string]$TargetMailbox,
-        [int]$DaysBack = 30
+        [int]$DaysBack = 30,
+        [int]$MaxItemsPerFolder = 2000,
+        [string]$Server
     )
 
-    $results = @()
-
-    # Step 1: Get folder stats to identify heavy folders
-    $folders = Get-MailboxFolderStatistics -Identity $Mailbox -ErrorAction Stop |
-               Where-Object { $_.ItemsInFolder -gt 0 }
-
-    if ($FolderPath) {
-        $folders = $folders | Where-Object { $_.FolderPath -eq $FolderPath }
+    if (-not $Server) {
+        $Server = (Get-ExchangeServer | Where-Object { $_.ServerRole -match 'Mailbox' } | Select-Object -First 1).Fqdn
     }
 
-    $startDate = (Get-Date).AddDays(-$DaysBack)
+    $folders = @(Get-MailboxFolderStatistics -Identity $Mailbox -ErrorAction Stop |
+                 Where-Object { $_.ItemsInFolder -gt 0 })
+    if ($FolderPath) {
+        $folders = @($folders | Where-Object { $_.FolderPath -eq $FolderPath })
+    }
 
-    # Step 2: For each folder with items, do estimate search
-    # We search the mailbox scoped to each folder and look for subjects
-    # that produce high result counts
+    $sinceUtc = (Get-Date).AddDays(-$DaysBack).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+    $restrictionXml = @"
+      <m:Restriction>
+        <t:IsGreaterThanOrEqualTo>
+          <t:FieldURI FieldURI="item:DateTimeReceived" />
+          <t:FieldURIOrConstant>
+            <t:Constant Value="$sinceUtc" />
+          </t:FieldURIOrConstant>
+        </t:IsGreaterThanOrEqualTo>
+      </m:Restriction>
+"@
+
+    $results = @()
     foreach ($folder in $folders) {
-        $folderName = $folder.FolderPath.TrimStart('/')
+        if ("$($folder.FolderType)" -match 'Recoverable|Audits|Calendar|Contacts|Tasks|Notes|Journal|Conversation|Sync') { continue }
+        $folderName = "$($folder.FolderPath)".TrimStart('/')
         if (-not $folderName) { continue }
-        if ($folder.FolderType -in @('RecoverableItems','Audits','Calendar','Contacts','Tasks')) { continue }
-
-        $query = Build-SearchQuery -Folder $folderName -StartDate $startDate
 
         try {
-            $estimate = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
-                        -EstimateResultOnly -ErrorAction Stop
+            $folderXml = Get-EwsFolderXml -Mailbox $Mailbox -FolderPath $folderName -Server $Server
+            $found = Get-EwsFolderMessages -Mailbox $Mailbox -Server $Server `
+                        -ParentFolderXml $folderXml -RestrictionXml $restrictionXml `
+                        -MaxItems $MaxItemsPerFolder
 
-            if ($estimate.ResultItemsCount -gt 0) {
-                $results += [PSCustomObject]@{
-                    FolderPath  = $folder.FolderPath
-                    FolderType  = $folder.FolderType
-                    ItemCount   = $folder.ItemsInFolder
-                    SearchHits  = $estimate.ResultItemsCount
-                    FolderSize  = "$($folder.FolderSize)"
-                    OldestItem  = "$($folder.OldestItemReceivedDate)"
-                    NewestItem  = "$($folder.NewestItemReceivedDate)"
-                    Status      = if ($estimate.ResultItemsCount -gt $folder.ItemsInFolder) { 'PossibleDupes' } else { 'Normal' }
-                }
+            $groups = @($found.Items | Group-Object {
+                $day = if ($_.Received.Length -ge 10) { $_.Received.Substring(0, 10) } else { $_.Received }
+                "$($_.Subject)|$($_.From)|$day"
+            } | Where-Object { $_.Count -gt 1 })
+
+            $dupItems = 0
+            foreach ($g in $groups) { $dupItems += ($g.Count - 1) }  # keep one per group
+
+            $results += [PSCustomObject]@{
+                FolderPath      = $folder.FolderPath
+                FolderType      = "$($folder.FolderType)"
+                ItemCount       = $folder.ItemsInFolder
+                ItemsScanned    = $found.Items.Count
+                DuplicateGroups = $groups.Count
+                DuplicateItems  = $dupItems
+                FolderSize      = "$($folder.FolderSize)"
+                Status          = if ($groups.Count -gt 0) { 'PossibleDupes' } else { 'Normal' }
             }
         } catch {
             $results += [PSCustomObject]@{
-                FolderPath = $folder.FolderPath; FolderType = $folder.FolderType
-                ItemCount = $folder.ItemsInFolder; Error = "$_"
+                FolderPath      = $folder.FolderPath
+                FolderType      = "$($folder.FolderType)"
+                ItemCount       = $folder.ItemsInFolder
+                ItemsScanned    = 0
+                DuplicateGroups = 0
+                DuplicateItems  = 0
+                FolderSize      = "$($folder.FolderSize)"
+                Status          = "Error: $_"
             }
         }
     }
@@ -1412,82 +1535,102 @@ function Find-MailboxDuplicates {
 function Remove-FolderDuplicates {
     <#
     .SYNOPSIS
-        Remove duplicate messages from a specific folder.
-        Strategy: Export folder content to a discovery mailbox (which dedupes),
-        then delete original folder content and copy back from discovery.
-
-        Simpler approach: Search for messages with same subject in the folder,
-        log to target mailbox (which captures unique), then delete all from source
-        folder and rely on the target copy.
+        Backup a folder's items into a new backup folder in the SAME mailbox
+        via EWS, optionally removing them from the source folder.
+        BackupOnly      = CopyItem (originals stay in the source folder).
+        BackupAndDelete = MoveItem (single atomic backup + remove from source).
     .DESCRIPTION
-        This is a two-step process:
-        1. Copy unique messages to target/backup mailbox folder
-        2. Delete from source folder
-
-        IMPORTANT: Always backup first! Use Estimate to review before deleting.
+        Search-Mailbox cannot scope to a folder and EWS cannot copy items
+        across mailboxes, so the backup folder is created under the root of
+        the same mailbox ("Backup-<folder>-<timestamp>").
     #>
     [CmdletBinding()]
     param(
         [Parameter(Mandatory)][string]$Mailbox,
         [Parameter(Mandatory)][string]$FolderPath,
-        [Parameter(Mandatory)][string]$TargetMailbox,
-        [string]$TargetFolder = 'DuplicateBackup',
+        [string]$BackupFolderName,
         [ValidateSet('BackupOnly','BackupAndDelete')]
-        [string]$Action = 'BackupOnly'
+        [string]$Action = 'BackupOnly',
+        [string]$Server
     )
 
-    $folderName = $FolderPath.TrimStart('/')
-    $query = Build-SearchQuery -Folder $folderName
-    $results = @()
-
-    # Step 1: Always backup first — copy to target mailbox
-    try {
-        $copyResult = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
-                      -TargetMailbox $TargetMailbox -TargetFolder $TargetFolder `
-                      -ErrorAction Stop
-
-        $results += [PSCustomObject]@{
-            Step        = '1-Backup'
-            Mailbox     = $Mailbox
-            Folder      = $FolderPath
-            Action      = 'CopyToTarget'
-            ItemsCopied = $copyResult.ResultItemsCount
-            TargetMailbox = $TargetMailbox
-            TargetFolder  = $TargetFolder
-            Success     = $copyResult.Success
-            Timestamp   = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        }
-    } catch {
-        return [PSCustomObject]@{
-            Step = '1-Backup'; Action = 'CopyToTarget'; Success = $false; Error = "$_"
-            Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-        }
+    if (-not $Server) {
+        $Server = (Get-ExchangeServer | Where-Object { $_.ServerRole -match 'Mailbox' } | Select-Object -First 1).Fqdn
     }
 
-    # Step 2: Delete from source folder (only if BackupAndDelete)
-    if ($Action -eq 'BackupAndDelete') {
+    $ewsUrl = "https://$Server/EWS/Exchange.asmx"
+    $escapedMailbox = [System.Security.SecurityElement]::Escape($Mailbox)
+    $folderClean = $FolderPath.TrimStart('/').Trim()
+
+    $sourceXml = Get-EwsFolderXml -Mailbox $Mailbox -FolderPath $folderClean -Server $Server
+
+    if (-not $BackupFolderName) {
+        $leaf = ($folderClean -split '[\\/]')[-1]
+        $BackupFolderName = "Backup-$leaf-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+    }
+    $escapedBackupName = [System.Security.SecurityElement]::Escape($BackupFolderName)
+
+    # Create the backup folder under the mailbox root
+    $createBody = @"
+    <m:CreateFolder>
+      <m:ParentFolderId>
+        <t:DistinguishedFolderId Id="msgfolderroot">
+          <t:Mailbox><t:EmailAddress>$escapedMailbox</t:EmailAddress></t:Mailbox>
+        </t:DistinguishedFolderId>
+      </m:ParentFolderId>
+      <m:Folders>
+        <t:Folder>
+          <t:DisplayName>$escapedBackupName</t:DisplayName>
+        </t:Folder>
+      </m:Folders>
+    </m:CreateFolder>
+"@
+    $xml = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $createBody -Mailbox $Mailbox
+    $ns = New-EwsNamespaceManager -Xml $xml
+    $backupIdNode = $xml.SelectSingleNode('//t:Folder/t:FolderId', $ns)
+    if (-not $backupIdNode) {
+        throw "Could not create backup folder '$BackupFolderName' in mailbox $Mailbox"
+    }
+    $backupFolderId = $backupIdNode.GetAttribute('Id')
+
+    $found = Get-EwsFolderMessages -Mailbox $Mailbox -Server $Server -ParentFolderXml $sourceXml
+    $itemIds = @($found.Items)
+
+    $op = if ($Action -eq 'BackupAndDelete') { 'MoveItem' } else { 'CopyItem' }
+    $processed = 0
+    for ($i = 0; $i -lt $itemIds.Count; $i += 100) {
+        $batch = @($itemIds[$i..([Math]::Min($i + 99, $itemIds.Count - 1))])
+        $itemIdXml = ($batch | ForEach-Object {
+            "<t:ItemId Id=`"$($_.Id)`" ChangeKey=`"$($_.ChangeKey)`" />"
+        }) -join "`n        "
+        $opBody = @"
+    <m:$op>
+      <m:ToFolderId>
+        <t:FolderId Id="$backupFolderId" />
+      </m:ToFolderId>
+      <m:ItemIds>
+        $itemIdXml
+      </m:ItemIds>
+    </m:$op>
+"@
         try {
-            $deleteResult = Search-Mailbox -Identity $Mailbox -SearchQuery $query `
-                           -DeleteContent -Force -ErrorAction Stop
-
-            $results += [PSCustomObject]@{
-                Step         = '2-Delete'
-                Mailbox      = $Mailbox
-                Folder       = $FolderPath
-                Action       = 'DeleteContent'
-                ItemsDeleted = $deleteResult.ResultItemsCount
-                Success      = $deleteResult.Success
-                Timestamp    = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            }
+            $null = Invoke-EwsRequest -EwsUrl $ewsUrl -SoapBody $opBody -Mailbox $Mailbox
+            $processed += $batch.Count
         } catch {
-            $results += [PSCustomObject]@{
-                Step = '2-Delete'; Action = 'DeleteContent'; Success = $false; Error = "$_"
-                Timestamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-            }
+            Write-Warning "$op batch failed: $_"
         }
     }
 
-    return $results
+    return [PSCustomObject]@{
+        Mailbox        = $Mailbox
+        SourceFolder   = "/$folderClean"
+        BackupFolder   = $BackupFolderName
+        Action         = if ($Action -eq 'BackupAndDelete') { 'Move (backup + remove from source)' } else { 'Copy (backup only)' }
+        ItemsFound     = $itemIds.Count
+        ItemsProcessed = $processed
+        Success        = ($processed -eq $itemIds.Count)
+        Timestamp      = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    }
 }
 
 # ═══════════════════════════════════════════════════════════════════════════════

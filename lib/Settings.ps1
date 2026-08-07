@@ -16,15 +16,9 @@ function Initialize-AppData {
 }
 
 function Get-AppSettings {
-    $settingsFile = Join-Path $script:AppDataPath 'settings.json'
-    if (Test-Path $settingsFile) {
-        try {
-            return Get-Content -Path $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
-        } catch {
-            return [PSCustomObject]@{}
-        }
-    }
-    return [PSCustomObject]@{
+    # Returns a hashtable (merged over defaults) so assigning a key that is
+    # missing from an older settings.json cannot throw and lose the save.
+    $settings = @{
         LastServer       = ''
         RecentServers    = @()
         WindowWidth      = 1400
@@ -33,6 +27,16 @@ function Get-AppSettings {
         DefaultBatchSize = 50
         MaxResults       = 500
     }
+    $settingsFile = Join-Path $script:AppDataPath 'settings.json'
+    if (Test-Path $settingsFile) {
+        try {
+            $json = Get-Content -Path $settingsFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            foreach ($prop in $json.PSObject.Properties) {
+                $settings[$prop.Name] = $prop.Value
+            }
+        } catch {}
+    }
+    return $settings
 }
 
 function Save-AppSettings {

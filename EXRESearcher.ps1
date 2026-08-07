@@ -1,12 +1,12 @@
 ﻿<#
 .SYNOPSIS
-    EXRESearcher v1.0 — Exchange Content Search & Cleanup GUI.
+    EXRESearcher v1.4 - Exchange Content Search & Cleanup GUI.
 .DESCRIPTION
     WinForms GUI for searching mailbox content, compliance searches,
     and organization-wide message deletion (phishing/malware cleanup).
     All Exchange operations run asynchronously via runspaces.
 .NOTES
-    Version: 1.3.0
+    Version: 1.4.0
     Requires: Exchange 2019 SE, Windows PowerShell 5.1
 #>
 
@@ -176,6 +176,84 @@ function Set-DGVData {
     } catch {}
 }
 
+# Per-operation context for async callbacks. Locals of a finished click
+# handler are NOT visible when OnComplete fires later (PS 5.1 dynamic
+# scoping), so handlers stash values here before Start-AsyncJob.
+$script:JobCtx = @{}
+
+function Show-WhatIfOutput {
+    param([string]$Command, [string]$Output)
+    $resDlg = New-Object System.Windows.Forms.Form
+    $resDlg.Text = 'WhatIf Results'
+    $resDlg.Size = New-Object System.Drawing.Size(700, 400)
+    $resDlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $resDlg.StartPosition = 'CenterScreen'
+
+    $resTxt = New-Object System.Windows.Forms.TextBox
+    $resTxt.Multiline = $true; $resTxt.ScrollBars = 'Both'; $resTxt.WordWrap = $false
+    $resTxt.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $resTxt.Dock = 'Fill'; $resTxt.ReadOnly = $true
+    $resTxt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
+    $resTxt.ForeColor = [System.Drawing.Color]::FromArgb(180,220,180)
+    $resTxt.Text = "# Command:`r`n$Command`r`n`r`n# Output:`r`n$Output"
+
+    $resBar = New-Object System.Windows.Forms.FlowLayoutPanel
+    $resBar.Dock = 'Bottom'; $resBar.Height = 44
+    $resBar.FlowDirection = 'RightToLeft'
+    $resBar.Padding = New-Object System.Windows.Forms.Padding(6)
+    $resClose = New-Btn -Text 'Close' -W 90
+    $resClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
+    $resCopy = New-Btn -Text 'Copy' -W 90 -Color 'Blue'
+    $script:WhatIfOutputBox = $resTxt
+    $resCopy.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($script:WhatIfOutputBox.Text) })
+    $resBar.Controls.AddRange(@($resClose, $resCopy))
+
+    $resDlg.Controls.Add($resTxt); $resDlg.Controls.Add($resBar); $resTxt.BringToFront()
+    [void]$resDlg.ShowDialog()
+    $resDlg.Dispose()
+}
+
+function Start-WhatIfJob {
+    # Runs command text with -WhatIf appended, asynchronously (the old
+    # synchronous version froze the UI and ran in the wrong runspace).
+    param([string]$CommandText, [System.Windows.Forms.Button]$Button)
+
+    $lines = $CommandText -split "`r?`n"
+    $whatIfCmd = @()
+    foreach ($line in $lines) {
+        $l = $line.Trim()
+        if (-not $l -or $l.StartsWith('#')) { continue }
+        # Append -WhatIf only to state-changing commands; Get-/Test- are read-only
+        if ($l -notmatch '^(\$\w+\s*=\s*)?(Get-|Test-)' -and $l -notmatch '-WhatIf') { $l += ' -WhatIf' }
+        $whatIfCmd += $l
+    }
+    if ($whatIfCmd.Count -eq 0) { return }
+
+    $script:WhatIfCommand = $whatIfCmd -join "`r`n"
+    $script:WhatIfButton = $Button
+    if ($Button) { $Button.Enabled = $false; $Button.Text = 'Running...' }
+
+    Start-AsyncJob -Name 'WhatIf' -ScriptBlock {
+        param($Command)
+        try {
+            $sb = [scriptblock]::Create($Command)
+            & $sb 2>&1 | Out-String
+        } catch { "Error: $_" }
+    } -Parameters @{ Command = $script:WhatIfCommand } -OnComplete {
+        param($output)
+        try {
+            if ($script:WhatIfButton) { $script:WhatIfButton.Enabled = $true; $script:WhatIfButton.Text = 'WhatIf' }
+            Show-WhatIfOutput -Command $script:WhatIfCommand -Output "$output"
+        } catch {}
+    } -OnError {
+        param($err)
+        try {
+            if ($script:WhatIfButton) { $script:WhatIfButton.Enabled = $true; $script:WhatIfButton.Text = 'WhatIf' }
+            Show-WhatIfOutput -Command $script:WhatIfCommand -Output "Error: $err"
+        } catch {}
+    }
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # MAIN GUI
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -183,7 +261,7 @@ function Set-DGVData {
 function Show-EXRESearcherGUI {
 
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'EXRESearcher v1.3 — Exchange Content Search & Cleanup'
+    $form.Text = 'EXRESearcher v1.4 - Exchange Content Search & Cleanup'
     $form.Size = New-Object System.Drawing.Size(1400, 900)
     $form.MinimumSize = New-Object System.Drawing.Size(1100, 700)
     $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
@@ -384,6 +462,7 @@ function Show-EXRESearcherGUI {
         if (-not $mbx -or -not $query -or $count -eq '0') { return }
 
         $serverFqdn = $txtServer.Text.Trim()
+        $script:JobCtx['Preview'] = $mbx
         Update-StatusBar "Loading message preview for $mbx..."
 
         Start-AsyncJob -Name "Preview $mbx" -Form $form -ScriptBlock {
@@ -400,7 +479,7 @@ function Show-EXRESearcherGUI {
 
                 # Build preview dialog
                 $dlg = New-Object System.Windows.Forms.Form
-                $dlg.Text = "Message Preview: $mbx ($($messages.Count) messages)"
+                $dlg.Text = "Message Preview: $($script:JobCtx['Preview']) ($($messages.Count) messages)"
                 $dlg.Size = New-Object System.Drawing.Size(1100, 600)
                 $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
                 $dlg.StartPosition = 'CenterParent'
@@ -435,7 +514,7 @@ function Show-EXRESearcherGUI {
                 $dlg.Controls.Add($bottomBar)
                 $grid.BringToFront()
 
-                Update-StatusBar "Preview loaded: $($messages.Count) messages in $mbx"
+                Update-StatusBar "Preview loaded: $($messages.Count) messages in $($script:JobCtx['Preview'])"
                 [void]$dlg.ShowDialog($form)
                 $dlg.Dispose()
             } catch {
@@ -497,7 +576,8 @@ function Show-EXRESearcherGUI {
     $getMailboxScope = {
         $scopeText = $txtScope.Text
         if (-not $scopeText -or $scopeText -match '^\(') { return @() }
-        return @($scopeText -split '[,;\s]+' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        # Split on , and ; only - identities may contain spaces (display names)
+        return @($scopeText -split '[,;]' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
     }
 
     # --- Connection guard ---
@@ -563,67 +643,9 @@ function Show-EXRESearcherGUI {
         $btnWhatIf = New-Btn -Text 'WhatIf' -W 90 -Color 'Orange'
         $btnWhatIf.Add_Click({
             try {
-                # Take command from textbox, append -WhatIf to each line
-                $lines = $txt.Text -split "`r?`n"
-                $whatIfCmd = @()
-                foreach ($line in $lines) {
-                    $l = $line.Trim()
-                    if (-not $l -or $l.StartsWith('#')) { continue }
-                    if ($l -notmatch '-WhatIf') { $l += ' -WhatIf' }
-                    $whatIfCmd += $l
-                }
-                if ($whatIfCmd.Count -eq 0) { return }
-                $script = $whatIfCmd -join "`r`n"
-
-                # Run WhatIf and capture output
-                $btnWhatIf.Enabled = $false
-                $btnWhatIf.Text = 'Running...'
-                $dlg.Refresh()
-
-                $output = try {
-                    $sb = [scriptblock]::Create($script)
-                    & $sb 2>&1 | Out-String
-                } catch { "Error: $_" }
-
-                # Show output in a result dialog
-                $resDlg = New-Object System.Windows.Forms.Form
-                $resDlg.Text = 'WhatIf Results'
-                $resDlg.Size = New-Object System.Drawing.Size(700, 400)
-                $resDlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-                $resDlg.StartPosition = 'CenterParent'
-
-                $resTxt = New-Object System.Windows.Forms.TextBox
-                $resTxt.Multiline = $true
-                $resTxt.ScrollBars = 'Both'
-                $resTxt.WordWrap = $false
-                $resTxt.Font = New-Object System.Drawing.Font('Consolas', 10)
-                $resTxt.Dock = 'Fill'
-                $resTxt.ReadOnly = $true
-                $resTxt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
-                $resTxt.ForeColor = [System.Drawing.Color]::FromArgb(180,220,180)
-                $resTxt.Text = "# Command:`r`n$script`r`n`r`n# Output:`r`n$output"
-
-                $resBar = New-Object System.Windows.Forms.FlowLayoutPanel
-                $resBar.Dock = 'Bottom'
-                $resBar.Height = 44
-                $resBar.FlowDirection = 'RightToLeft'
-                $resBar.Padding = New-Object System.Windows.Forms.Padding(6)
-                $resClose = New-Btn -Text 'Close' -W 90
-                $resClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
-                $resCopy = New-Btn -Text 'Copy' -W 90 -Color 'Blue'
-                $resCopy.Add_Click({ [System.Windows.Forms.Clipboard]::SetText($resTxt.Text) })
-                $resBar.Controls.AddRange(@($resClose, $resCopy))
-
-                $resDlg.Controls.Add($resTxt)
-                $resDlg.Controls.Add($resBar)
-                $resTxt.BringToFront()
-                [void]$resDlg.ShowDialog($dlg)
-                $resDlg.Dispose()
+                Start-WhatIfJob -CommandText $txt.Text -Button $btnWhatIf
             } catch {
                 [System.Windows.Forms.MessageBox]::Show("WhatIf error: $_", 'Error', 'OK', 'Error')
-            } finally {
-                $btnWhatIf.Enabled = $true
-                $btnWhatIf.Text = 'WhatIf'
             }
         })
 
@@ -693,47 +715,10 @@ function Show-EXRESearcherGUI {
         })
         $btnWhatIf2.Add_Click({
             try {
-                $lines = $CommandText -split "`r?`n"
-                $whatIfCmd = @()
-                foreach ($line in $lines) {
-                    $l = $line.Trim()
-                    if (-not $l -or $l.StartsWith('#')) { continue }
-                    if ($l -notmatch '-WhatIf') { $l += ' -WhatIf' }
-                    $whatIfCmd += $l
-                }
-                if ($whatIfCmd.Count -eq 0) { return }
-                $script2 = $whatIfCmd -join "`r`n"
-                $btnWhatIf2.Enabled = $false
-                $btnWhatIf2.Text = 'Running...'
-                $dlg.Refresh()
-                $output = try {
-                    $sb = [scriptblock]::Create($script2)
-                    & $sb 2>&1 | Out-String
-                } catch { "Error: $_" }
-                $resDlg = New-Object System.Windows.Forms.Form
-                $resDlg.Text = 'WhatIf Results'
-                $resDlg.Size = New-Object System.Drawing.Size(700, 400)
-                $resDlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-                $resDlg.StartPosition = 'CenterParent'
-                $resTxt = New-Object System.Windows.Forms.TextBox
-                $resTxt.Multiline = $true; $resTxt.ScrollBars = 'Both'; $resTxt.WordWrap = $false
-                $resTxt.Font = New-Object System.Drawing.Font('Consolas', 10)
-                $resTxt.Dock = 'Fill'; $resTxt.ReadOnly = $true
-                $resTxt.BackColor = [System.Drawing.Color]::FromArgb(30,30,30)
-                $resTxt.ForeColor = [System.Drawing.Color]::FromArgb(180,220,180)
-                $resTxt.Text = "# Command:`r`n$script2`r`n`r`n# Output:`r`n$output"
-                $resClose = New-Btn -Text 'Close' -W 90
-                $resClose.DialogResult = [System.Windows.Forms.DialogResult]::OK
-                $resBar = New-Object System.Windows.Forms.FlowLayoutPanel
-                $resBar.Dock = 'Bottom'; $resBar.Height = 44
-                $resBar.FlowDirection = 'RightToLeft'
-                $resBar.Padding = New-Object System.Windows.Forms.Padding(6)
-                $resBar.Controls.Add($resClose)
-                $resDlg.Controls.Add($resTxt); $resDlg.Controls.Add($resBar); $resTxt.BringToFront()
-                [void]$resDlg.ShowDialog($dlg); $resDlg.Dispose()
+                Start-WhatIfJob -CommandText $CommandText -Button $btnWhatIf2
             } catch {
                 [System.Windows.Forms.MessageBox]::Show("WhatIf error: $_", 'Error', 'OK', 'Error')
-            } finally { $btnWhatIf2.Enabled = $true; $btnWhatIf2.Text = 'WhatIf' }
+            }
         })
 
         $btnBar.Controls.AddRange(@($btnCancel, $btnOK, $btnWhatIf2, $btnScript))
@@ -767,6 +752,17 @@ function Show-EXRESearcherGUI {
         $targetMbx = if ($Action -in @('LogOnly','CopyToFolder')) { $txtTarget.Text } else { '' }
         $targetFld = $txtTargetFolder.Text
 
+        $msgIdValue = $txtMsgId.Text.Trim()
+        $serverFqdn = $txtServer.Text.Trim()
+
+        # MessageId lookup goes through EWS - Log/Copy have no EWS equivalent here
+        if ($msgIdValue -and $Action -in @('LogOnly','CopyToFolder')) {
+            [System.Windows.Forms.MessageBox]::Show(
+                "MessageId search only supports Estimate and Delete.`nLog/Copy are not available for MessageId lookup.",
+                'MessageId Search', 'OK', 'Information')
+            return
+        }
+
         # Build command string for preview
         $cmdLines = @()
         $queryEscaped = $query -replace '"', '`"'
@@ -798,16 +794,7 @@ function Show-EXRESearcherGUI {
             if ((& $showCommandPreview -CommandText $cmdText -Title "Search-Mailbox ($Action)") -eq 'Cancel') { return }
         }
 
-        $msgIdValue = $txtMsgId.Text.Trim()
-        $serverFqdn = $txtServer.Text.Trim()
-
-        if ($msgIdValue -and $Action -in @('LogOnly','CopyToFolder')) {
-            [System.Windows.Forms.MessageBox]::Show(
-                "MessageId search only supports Estimate and Delete.`nLog/Copy are not available for MessageId lookup.",
-                'MessageId Search', 'OK', 'Information')
-            return
-        }
-
+        $script:JobCtx['Search'] = @{ Query = $query; Scope = ($mailboxes -join ','); Action = $Action }
         Update-StatusBar "Searching ($Action)..."
 
         Start-AsyncJob -Name "Search ($Action)" -Form $form -ScriptBlock {
@@ -850,9 +837,10 @@ function Show-EXRESearcherGUI {
                 $lblSearchCount.Text = "$($result.Count) mailbox(es), $totalItems item(s) found"
                 Update-StatusBar "Search complete: $totalItems items in $($result.Count) mailboxes"
                 try {
-                    Write-SearchLog -Action $Action -SearchQuery $query -Scope ($mailboxes -join ',') -Result "$totalItems items"
-                    Add-SearchHistory -Query $query -Scope ($mailboxes -join ',') -Action $Action
-                    Write-OperatorLog -Action "Search-$Action" -Target ($mailboxes -join ',') -Details "Query=$query Items=$totalItems"
+                    $ctx = $script:JobCtx['Search']
+                    Write-SearchLog -Action $ctx.Action -SearchQuery $ctx.Query -Scope $ctx.Scope -Result "$totalItems items"
+                    Add-SearchHistory -Query $ctx.Query -Scope $ctx.Scope -Action $ctx.Action
+                    Write-OperatorLog -Action "Search-$($ctx.Action)" -Target $ctx.Scope -Details "Query=$($ctx.Query) Items=$totalItems"
                 } catch {}
             } catch {
                 Update-StatusBar "Search UI error: $_"
@@ -999,6 +987,7 @@ function Show-EXRESearcherGUI {
         if (-not $mbx -or -not $query -or $count -eq '0') { return }
 
         $serverFqdn = $txtServer.Text.Trim()
+        $script:JobCtx['Preview'] = $mbx
         Update-StatusBar "Loading message preview for $mbx..."
 
         Start-AsyncJob -Name "Preview $mbx" -Form $form -ScriptBlock {
@@ -1014,7 +1003,7 @@ function Show-EXRESearcherGUI {
                 }
 
                 $dlg = New-Object System.Windows.Forms.Form
-                $dlg.Text = "Message Preview: $mbx ($($messages.Count) messages)"
+                $dlg.Text = "Message Preview: $($script:JobCtx['Preview']) ($($messages.Count) messages)"
                 $dlg.Size = New-Object System.Drawing.Size(1100, 600)
                 $dlg.Font = New-Object System.Drawing.Font('Segoe UI', 9)
                 $dlg.StartPosition = 'CenterParent'
@@ -1047,7 +1036,7 @@ function Show-EXRESearcherGUI {
                 $dlg.Controls.Add($bottomBar)
                 $grid.BringToFront()
 
-                Update-StatusBar "Preview: $($messages.Count) messages in $mbx"
+                Update-StatusBar "Preview: $($messages.Count) messages in $($script:JobCtx['Preview'])"
                 [void]$dlg.ShowDialog($form)
                 $dlg.Dispose()
             } catch {
@@ -1121,6 +1110,7 @@ function Show-EXRESearcherGUI {
         }
 
         $whatIf = -not $Delete
+        $script:JobCtx['Org'] = @{ Query = $query }
         Update-StatusBar "Org-wide $(if ($Delete) { 'DELETE' } else { 'estimate' })..."
 
         Start-AsyncJob -Name "OrgWide $(if ($Delete) { 'DELETE' } else { 'Estimate' })" -Form $form -ScriptBlock {
@@ -1151,7 +1141,7 @@ function Show-EXRESearcherGUI {
                 Update-StatusBar "Org-wide: $($summary.TotalItems) items in $($summary.AffectedMailboxes) mailboxes"
                 try {
                     Write-OperatorLog -Action "OrgWide-$($summary.Action)" -Target 'AllMailboxes' `
-                        -Details "Query=$query Items=$($summary.TotalItems) Affected=$($summary.AffectedMailboxes)"
+                        -Details "Query=$($script:JobCtx['Org'].Query) Items=$($summary.TotalItems) Affected=$($summary.AffectedMailboxes)"
                 } catch {}
             } catch {
                 Update-StatusBar "Org-wide UI error: $_"
@@ -1291,6 +1281,7 @@ function Show-EXRESearcherGUI {
             if ($estimateOnly) { $cmdText += " -EstimateOnly" }
             $cmdText += "`r`nStart-MailboxSearch -Identity `"$name`""
             if ((& $showCommandPreview -CommandText $cmdText -Title 'Create eDiscovery Search') -eq 'Cancel') { return }
+            $script:JobCtx['Comp'] = @{ Name = $name; Query = $query }
             Update-StatusBar "Creating eDiscovery search '$name'..."
 
             Start-AsyncJob -Name "Create eDiscovery: $name" -Form $form -ScriptBlock {
@@ -1306,8 +1297,9 @@ function Show-EXRESearcherGUI {
                 EstimateOnly = $estimateOnly
             } -OnComplete {
                 param($result)
-                Update-StatusBar "eDiscovery search '$name' created"
-                try { Write-OperatorLog -Action 'CreateSearch' -Target $name -Details "Query=$query" } catch {}
+                $ctx = $script:JobCtx['Comp']
+                Update-StatusBar "eDiscovery search '$($ctx.Name)' created"
+                try { Write-OperatorLog -Action 'CreateSearch' -Target $ctx.Name -Details "Query=$($ctx.Query)" } catch {}
                 & $refreshCompliance
             } -OnError {
                 param($err)
@@ -1323,6 +1315,7 @@ function Show-EXRESearcherGUI {
             if ($e.RowIndex -lt 0) { return }
             $searchName = "$($dgvCompliance.Rows[$e.RowIndex].Cells['Name'].Value)"
             if (-not $searchName) { return }
+            $script:JobCtx['CompStatus'] = $searchName
             Update-StatusBar "Getting status for '$searchName'..."
             Start-AsyncJob -Name "Status: $searchName" -Form $form -ScriptBlock {
                 param($Name)
@@ -1335,7 +1328,7 @@ function Show-EXRESearcherGUI {
                         [void]$sb.AppendLine("$($prop.Name): $($prop.Value)")
                     }
                     $txtCompDetail.Text = $sb.ToString()
-                    Update-StatusBar "Status loaded for '$searchName'"
+                    Update-StatusBar "Status loaded for '$($script:JobCtx['CompStatus'])'"
                 } catch {}
             } -OnError {
                 param($err)
@@ -1356,13 +1349,14 @@ function Show-EXRESearcherGUI {
         try {
             if ($dgvCompliance.SelectedRows.Count -eq 0) { return }
             $name = "$($dgvCompliance.SelectedRows[0].Cells['Name'].Value)"
+            $script:JobCtx['CompStop'] = $name
             Start-AsyncJob -Name "Stop: $name" -Form $form -ScriptBlock {
                 param($Name)
                 Stop-ContentSearch -Name $Name
             } -Parameters @{ Name = $name } -OnComplete {
                 param($r)
-                Update-StatusBar "Search '$name' stopped"
-                try { Write-OperatorLog -Action 'StopSearch' -Target $name } catch {}
+                Update-StatusBar "Search '$($script:JobCtx['CompStop'])' stopped"
+                try { Write-OperatorLog -Action 'StopSearch' -Target $script:JobCtx['CompStop'] } catch {}
                 & $refreshCompliance
             } -OnError { param($err) Update-StatusBar "Stop error: $err" }
         } catch {}
@@ -1374,13 +1368,14 @@ function Show-EXRESearcherGUI {
             $name = "$($dgvCompliance.SelectedRows[0].Cells['Name'].Value)"
             $confirm = [System.Windows.Forms.MessageBox]::Show("Remove search '$name'?", 'Confirm', 'YesNo', 'Question')
             if ($confirm -eq 'Yes') {
+                $script:JobCtx['CompRemove'] = $name
                 Start-AsyncJob -Name "Remove: $name" -Form $form -ScriptBlock {
                     param($Name)
                     Remove-ContentSearch -Name $Name
                 } -Parameters @{ Name = $name } -OnComplete {
                     param($r)
-                    Update-StatusBar "Search '$name' removed"
-                    try { Write-OperatorLog -Action 'RemoveSearch' -Target $name } catch {}
+                    Update-StatusBar "Search '$($script:JobCtx['CompRemove'])' removed"
+                    try { Write-OperatorLog -Action 'RemoveSearch' -Target $script:JobCtx['CompRemove'] } catch {}
                     & $refreshCompliance
                 } -OnError { param($err) Update-StatusBar "Remove error: $err" }
             }
@@ -1645,12 +1640,8 @@ function Show-EXRESearcherGUI {
     $btnFcFindDupes = New-Btn -Text 'Find Duplicates' -W 120 -Color 'Green'
     $btnFcBackupDupes = New-Btn -Text 'Backup Folder' -W 110
     $btnFcRemoveDupes = New-Btn -Text 'Backup + Delete' -W 120 -Color 'Red'
-    $lblFcTarget = New-InlineLabel -Text 'Target:' -MarginLeft 10
-    $txtFcTarget = New-Object System.Windows.Forms.TextBox
-    $txtFcTarget.Width = 180; $txtFcTarget.Height = 24
-    $txtFcTarget.Margin = New-Object System.Windows.Forms.Padding(3,6,3,4)
     $btnFcExport = New-Btn -Text 'Export...' -W 80
-    $folderBar3.Controls.AddRange(@($btnFcEstimate, $btnFcDelete, $btnFcPurge, $lblFcSep, $btnFcFindDupes, $btnFcBackupDupes, $btnFcRemoveDupes, $lblFcTarget, $txtFcTarget, $btnFcExport))
+    $folderBar3.Controls.AddRange(@($btnFcEstimate, $btnFcDelete, $btnFcPurge, $lblFcSep, $btnFcFindDupes, $btnFcBackupDupes, $btnFcRemoveDupes, $btnFcExport))
 
     $dgvFolder = New-StyledDGV
     $dgvFolder.Add_CellFormatting({
@@ -1724,6 +1715,7 @@ function Show-EXRESearcherGUI {
             return
         }
         if ((& $showCommandPreview -CommandText "Get-MailboxFolderStatistics -Identity `"$mbx`" | Select FolderPath, ItemsInFolder, FolderSize" -Title 'Load Folders') -eq 'Cancel') { return }
+        $script:JobCtx['Fc'] = @{ Mailbox = $mbx }
         Update-StatusBar "Loading folders for $mbx..."
         $btnFcLoadFolders.Enabled = $false
         Start-AsyncJob -Name "Folders $mbx" -Form $form -ScriptBlock {
@@ -1740,7 +1732,7 @@ function Show-EXRESearcherGUI {
                 $cmbFcFolder.SelectedIndex = 0
                 Set-DGVData -DGV $dgvFolder -Data $result
                 $script:LastFolderCleanup = $result
-                Update-StatusBar "Loaded $($result.Count) folders for $mbx"
+                Update-StatusBar "Loaded $($result.Count) folders for $($script:JobCtx['Fc'].Mailbox)"
             } catch { Update-StatusBar "Folder load error: $_" }
             $btnFcLoadFolders.Enabled = $true
         } -OnError {
@@ -1788,6 +1780,7 @@ function Show-EXRESearcherGUI {
         $att = $chkFcAttach.Checked
         $cmdText = & $buildFcCommand -Mbx $mbx -Folder $folder -Subj $subj -Frm $frm -Days $days -Sz $sz -Att $att -Action 'Estimate'
         if ((& $showCommandPreview -CommandText $cmdText -Title 'Folder Estimate') -eq 'Cancel') { return }
+        $script:JobCtx['FcEst'] = @{ Mailbox = $mbx }
         Update-StatusBar "Estimating folder cleanup for $mbx..."
         $btnFcEstimate.Enabled = $false
 
@@ -1814,7 +1807,7 @@ function Show-EXRESearcherGUI {
                 Set-DGVData -DGV $dgvFolder -Data $data
                 $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
                 Update-StatusBar "Folder estimate: $total item(s) match"
-                try { Write-SearchLog -Action 'FolderEstimate' -Scope $mbx -Result "$total items" } catch {}
+                try { Write-SearchLog -Action 'FolderEstimate' -Scope $script:JobCtx['FcEst'].Mailbox -Result "$total items" } catch {}
             } catch { Update-StatusBar "Folder estimate error: $_" }
             $btnFcEstimate.Enabled = $true
         } -OnError {
@@ -1852,6 +1845,7 @@ function Show-EXRESearcherGUI {
         $folderInfo = " from folder `"$folder`""
         $result = & $confirmDelete -Message "Delete matching messages from $mbx$folderInfo?`nThis action is permanent!" -CommandText $cmdText
         if ($result -ne 'OK') { return }
+        $script:JobCtx['FcDel'] = @{ Mailbox = $mbx; Folder = $folder }
         Update-StatusBar "Deleting messages from $mbx..."
         $btnFcDelete.Enabled = $false
 
@@ -1878,8 +1872,8 @@ function Show-EXRESearcherGUI {
                 Set-DGVData -DGV $dgvFolder -Data $data
                 $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
                 Update-StatusBar "Folder delete complete: $total item(s) deleted"
-                try { Write-SearchLog -Action 'FolderDelete' -Scope $mbx -Result "$total items deleted" } catch {}
-                try { Write-OperatorLog -Action 'FolderDelete' -Target $mbx -Details "$total items" } catch {}
+                try { Write-SearchLog -Action 'FolderDelete' -Scope $script:JobCtx['FcDel'].Mailbox -Result "$total items deleted" } catch {}
+                try { Write-OperatorLog -Action 'FolderDelete' -Target $script:JobCtx['FcDel'].Mailbox -Details "Folder=$($script:JobCtx['FcDel'].Folder) Items=$total" } catch {}
             } catch { Update-StatusBar "Folder delete error: $_" }
             $btnFcDelete.Enabled = $true
         } -OnError {
@@ -1921,6 +1915,7 @@ function Show-EXRESearcherGUI {
             $action = 'Estimate'
         }
 
+        $script:JobCtx['FcPurge'] = @{ Mailbox = $mbx; Action = $action }
         Update-StatusBar "Purging dumpster for $mbx ($action)..."
         $btnFcPurge.Enabled = $false
 
@@ -1934,8 +1929,8 @@ function Show-EXRESearcherGUI {
                 $script:LastFolderCleanup = $data
                 Set-DGVData -DGV $dgvFolder -Data $data
                 $total = ($data | Measure-Object -Property ResultItems -Sum).Sum
-                Update-StatusBar "Dumpster $action`: $total item(s)"
-                try { Write-SearchLog -Action "DumpsterPurge-$action" -Scope $mbx -Result "$total items" } catch {}
+                Update-StatusBar "Dumpster $($script:JobCtx['FcPurge'].Action): $total item(s)"
+                try { Write-SearchLog -Action "DumpsterPurge-$($script:JobCtx['FcPurge'].Action)" -Scope $script:JobCtx['FcPurge'].Mailbox -Result "$total items" } catch {}
             } catch { Update-StatusBar "Dumpster error: $_" }
             $btnFcPurge.Enabled = $true
         } -OnError {
@@ -1953,19 +1948,21 @@ function Show-EXRESearcherGUI {
             return
         }
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
-        $cmdText = "# Scan for duplicate messages (by Subject + Sender + Date)`r`nGet-MailboxFolderStatistics -Identity `"$mbx`""
-        if ($folder) { $cmdText += " | Where FolderPath -eq `"/$folder`"" }
-        $cmdText += "`r`n# Then compare items within each folder for duplicates"
+        $cmdText = "# EWS scan for duplicate messages (same Subject + From + received date)`r`n# Mailbox: $mbx, last 30 days`r`nGet-MailboxFolderStatistics -Identity `"$mbx`""
+        if ($folder) { $cmdText += " | Where FolderPath -eq `"$folder`"" }
+        $cmdText += "`r`n# Then EWS FindItem per folder, items grouped client-side"
         if ((& $showCommandPreview -CommandText $cmdText -Title 'Find Duplicates') -eq 'Cancel') { return }
         Update-StatusBar "Scanning for duplicates in $mbx..."
         $btnFcFindDupes.Enabled = $false
 
+        $srv = $txtServer.Text.Trim()
         Start-AsyncJob -Name "FindDupes $mbx" -Form $form -ScriptBlock {
-            param($Mailbox, $FolderPath)
+            param($Mailbox, $FolderPath, $Server)
             $p = @{ Mailbox = $Mailbox; DaysBack = 30 }
             if ($FolderPath) { $p['FolderPath'] = $FolderPath }
+            if ($Server)     { $p['Server'] = $Server }
             Find-MailboxDuplicates @p
-        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder } -OnComplete {
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; Server = $srv } -OnComplete {
             param($result)
             try {
                 $data = @($result)
@@ -1985,32 +1982,32 @@ function Show-EXRESearcherGUI {
     $btnFcBackupDupes.Add_Click({
         if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
-        $target = $txtFcTarget.Text.Trim()
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
         if (-not $mbx -or -not $folder) {
             [System.Windows.Forms.MessageBox]::Show('Enter mailbox and select a specific folder.','Duplicates','OK','Warning')
             return
         }
-        if (-not $target) {
-            [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
-            return
-        }
-        $cmdText = "Search-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -TargetMailbox `"$target`" -TargetFolder `"Backup-$folder`" -LogOnly"
+        $cmdText = "# EWS CopyItem: copy all items from folder `"$folder`" of mailbox `"$mbx`"`r`n# into a new folder `"Backup-<folder>-<timestamp>`" in the SAME mailbox.`r`n# (Search-Mailbox cannot scope to a folder; EWS cannot copy across mailboxes.)`r`n# Originals stay in the source folder."
         if ((& $showCommandPreview -CommandText $cmdText -Title 'Backup Folder') -eq 'Cancel') { return }
-        Update-StatusBar "Backing up folder $folder from $mbx..."
+        $script:JobCtx['FcBackup'] = @{ Mailbox = $mbx; Folder = $folder }
+        Update-StatusBar "Backing up folder $folder in $mbx..."
         $btnFcBackupDupes.Enabled = $false
 
+        $srv = $txtServer.Text.Trim()
         Start-AsyncJob -Name "BackupFolder $mbx" -Form $form -ScriptBlock {
-            param($Mailbox, $FolderPath, $TargetMailbox)
-            Remove-FolderDuplicates -Mailbox $Mailbox -FolderPath $FolderPath -TargetMailbox $TargetMailbox -Action 'BackupOnly'
-        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; TargetMailbox = $target } -OnComplete {
+            param($Mailbox, $FolderPath, $Server)
+            $p = @{ Mailbox = $Mailbox; FolderPath = $FolderPath; Action = 'BackupOnly' }
+            if ($Server) { $p['Server'] = $Server }
+            Remove-FolderDuplicates @p
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; Server = $srv } -OnComplete {
             param($result)
             try {
                 $data = @($result)
                 $script:LastFolderCleanup = $data
                 Set-DGVData -DGV $dgvFolder -Data $data
-                Update-StatusBar "Folder backup complete"
-                try { Write-OperatorLog -Action 'FolderBackup' -Target $mbx -Details "Folder: $folder -> $target" } catch {}
+                $ctx = $script:JobCtx['FcBackup']
+                Update-StatusBar "Folder backup complete: $(@($data)[0].ItemsProcessed) item(s) copied to $(@($data)[0].BackupFolder)"
+                try { Write-OperatorLog -Action 'FolderBackup' -Target $ctx.Mailbox -Details "Folder=$($ctx.Folder) -> $(@($data)[0].BackupFolder) Items=$(@($data)[0].ItemsProcessed)" } catch {}
             } catch { Update-StatusBar "Backup error: $_" }
             $btnFcBackupDupes.Enabled = $true
         } -OnError {
@@ -2023,34 +2020,34 @@ function Show-EXRESearcherGUI {
     $btnFcRemoveDupes.Add_Click({
         if (-not (& $requireConnection)) { return }
         $mbx = $txtFcMailbox.Text.Trim()
-        $target = $txtFcTarget.Text.Trim()
         $folder = if ($cmbFcFolder.SelectedItem -and $cmbFcFolder.SelectedItem -ne '(All Folders)') { $cmbFcFolder.SelectedItem } else { '' }
         if (-not $mbx -or -not $folder) {
             [System.Windows.Forms.MessageBox]::Show('Enter mailbox and select a specific folder.','Duplicates','OK','Warning')
             return
         }
-        if (-not $target) {
-            [System.Windows.Forms.MessageBox]::Show('Enter a target mailbox for backup.','Duplicates','OK','Warning')
-            return
-        }
-        $cmdText = "# Step 1: Backup`r`nSearch-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -TargetMailbox `"$target`" -TargetFolder `"Backup-$folder`"`r`n# Step 2: Delete`r`nSearch-Mailbox -Identity `"$mbx`" -SearchQuery `"folder:$folder`" -DeleteContent -Force"
-        $result = & $confirmDelete -Message "BACKUP folder content to $target, then DELETE from $mbx.`n`nFolder: $folder" -CommandText $cmdText
+        $cmdText = "# EWS MoveItem: MOVE all items from folder `"$folder`" of mailbox `"$mbx`"`r`n# into a new folder `"Backup-<folder>-<timestamp>`" in the SAME mailbox.`r`n# Items disappear from the source folder but stay recoverable in the backup folder."
+        $result = & $confirmDelete -Message "MOVE folder content of $mbx to a backup folder in the same mailbox.`n`nFolder: $folder`nSource folder will become empty." -CommandText $cmdText
         if ($result -ne 'OK') { return }
 
-        Update-StatusBar "Backup + Delete folder $folder from $mbx..."
+        $script:JobCtx['FcMove'] = @{ Mailbox = $mbx; Folder = $folder }
+        Update-StatusBar "Backup + Delete (move) folder $folder in $mbx..."
         $btnFcRemoveDupes.Enabled = $false
 
+        $srv = $txtServer.Text.Trim()
         Start-AsyncJob -Name "RemoveDupes $mbx" -Form $form -ScriptBlock {
-            param($Mailbox, $FolderPath, $TargetMailbox)
-            Remove-FolderDuplicates -Mailbox $Mailbox -FolderPath $FolderPath -TargetMailbox $TargetMailbox -Action 'BackupAndDelete'
-        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; TargetMailbox = $target } -OnComplete {
+            param($Mailbox, $FolderPath, $Server)
+            $p = @{ Mailbox = $Mailbox; FolderPath = $FolderPath; Action = 'BackupAndDelete' }
+            if ($Server) { $p['Server'] = $Server }
+            Remove-FolderDuplicates @p
+        } -Parameters @{ Mailbox = $mbx; FolderPath = $folder; Server = $srv } -OnComplete {
             param($result)
             try {
                 $data = @($result)
                 $script:LastFolderCleanup = $data
                 Set-DGVData -DGV $dgvFolder -Data $data
-                Update-StatusBar "Backup + Delete complete"
-                try { Write-OperatorLog -Action 'FolderBackupDelete' -Target $mbx -Details "Folder: $folder -> $target" } catch {}
+                $ctx = $script:JobCtx['FcMove']
+                Update-StatusBar "Backup + Delete complete: $(@($data)[0].ItemsProcessed) item(s) moved to $(@($data)[0].BackupFolder)"
+                try { Write-OperatorLog -Action 'FolderBackupDelete' -Target $ctx.Mailbox -Details "Folder=$($ctx.Folder) -> $(@($data)[0].BackupFolder) Items=$(@($data)[0].ItemsProcessed)" } catch {}
             } catch { Update-StatusBar "Backup+Delete error: $_" }
             $btnFcRemoveDupes.Enabled = $true
         } -OnError {
@@ -2076,6 +2073,11 @@ function Show-EXRESearcherGUI {
         }
         $cmdText = "`$session = New-PSSession -ConfigurationName 'Microsoft.Exchange' -ConnectionUri `"http://$server/PowerShell/`" -Authentication Kerberos`r`nImport-PSSession `$session -DisableNameChecking -AllowClobber"
         if ((& $showCommandPreview -CommandText $cmdText -Title 'Connect to Exchange') -eq 'Cancel') { return }
+        $script:JobCtx['Connect'] = @{ Server = $server }
+        # Clear old connection marker so the job's runspace init does not
+        # import a session to the previous server before probing this one
+        $script:Session = $null
+        $btnDisconnect.Visible = $false
         Update-StatusBar "Connecting to $server..."
         $lblConnStatus.Text = 'Connecting...'
         $lblConnStatus.ForeColor = [System.Drawing.Color]::FromArgb(200,150,0)
@@ -2083,24 +2085,33 @@ function Show-EXRESearcherGUI {
 
         Start-AsyncJob -Name "Connect $server" -Form $form -ScriptBlock {
             param($Server)
-            $session = Connect-ExchangeSearch -Server $Server
+            # Validate connectivity only. Import-PSSession proxies live per
+            # runspace, so each async job imports its own session later
+            # (see Start-AsyncJob init); holding one here would be useless.
+            $session = $null
+            if (-not (Get-Command Get-ExchangeServer -ErrorAction SilentlyContinue)) {
+                $session = New-PSSession -ConfigurationName 'Microsoft.Exchange' `
+                            -ConnectionUri "http://$Server/PowerShell/" `
+                            -Authentication Kerberos -ErrorAction Stop
+                Import-PSSession -Session $session -DisableNameChecking -AllowClobber -ErrorAction Stop | Out-Null
+            }
             $version = Get-ExchangeServerVersion -Server $Server
-            return @{ Session = $session; Version = $version }
+            $isEms = ($null -eq $session)
+            if ($session) { Remove-PSSession -Session $session -ErrorAction SilentlyContinue }
+            return @{ IsEMS = $isEms; Version = $version }
         } -Parameters @{ Server = $server } -OnComplete {
             param($result)
             try {
-                if ($script:Session) {
-                    try { Disconnect-ExchangeSearch -Session $script:Session } catch {}
-                }
-                $script:Session = $result.Session
+                $srvName = $script:JobCtx['Connect'].Server
+                $script:Session = @{ IsEMS = [bool]$result.IsEMS; Server = $srvName }
                 $ver = $result.Version
-                $lblConnStatus.Text = "Connected: $server ($($ver.AdminVersion))"
+                $lblConnStatus.Text = "Connected: $srvName ($($ver.AdminVersion))"
                 $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
                 $btnConnect.Enabled = $true
                 $btnDisconnect.Visible = $true
-                try { Update-RecentServers -Server $server } catch {}
-                try { Write-OperatorLog -Action 'Connect' -Target $server } catch {}
-                Update-StatusBar "Connected to $server — $($ver.Edition) $($ver.AdminVersion)"
+                try { Update-RecentServers -Server $srvName } catch {}
+                try { Write-OperatorLog -Action 'Connect' -Target $srvName } catch {}
+                Update-StatusBar "Connected to $srvName - $($ver.Edition) $($ver.AdminVersion)"
             } catch {
                 $lblConnStatus.Text = 'Connection setup error'
                 $lblConnStatus.ForeColor = [System.Drawing.Color]::Red
@@ -2119,10 +2130,8 @@ function Show-EXRESearcherGUI {
 
     $btnDisconnect.Add_Click({
         try {
-            if ($script:Session) {
-                try { Disconnect-ExchangeSearch -Session $script:Session } catch {}
-                $script:Session = $null
-            }
+            # No live session is held in the GUI runspace - just clear the marker
+            $script:Session = $null
             $lblConnStatus.Text = 'Disconnected'
             $lblConnStatus.ForeColor = [System.Drawing.Color]::Gray
             $btnDisconnect.Visible = $false
@@ -2181,9 +2190,7 @@ function Show-EXRESearcherGUI {
             }
         } catch {}
 
-        if ($script:Session) {
-            try { Disconnect-ExchangeSearch -Session $script:Session } catch {}
-        }
+        $script:Session = $null
     })
 
     # ─── Auto-detect EMS and connect ─────────────────────────────────────────
@@ -2193,29 +2200,45 @@ function Show-EXRESearcherGUI {
                 Update-StatusBar 'Exchange Management Shell detected. Discovering servers...'
                 $lblConnStatus.Text = 'EMS detected...'
                 $lblConnStatus.ForeColor = [System.Drawing.Color]::FromArgb(200,150,0)
-                $form.Refresh()
 
-                $servers = @(Find-ExchangeServers)
-                if ($servers.Count -gt 0) {
-                    # Pick local server if possible, otherwise first one
-                    $localName = $env:COMPUTERNAME
-                    $local = $servers | Where-Object { $_.Name -eq $localName } | Select-Object -First 1
+                # Discovery runs async - Find-ExchangeServers can take seconds
+                Start-AsyncJob -Name 'EMS AutoConnect' -Form $form -ScriptBlock {
+                    param($LocalName)
+                    $servers = @(Find-ExchangeServers)
+                    if ($servers.Count -eq 0) { return @{ Servers = @() } }
+                    $local = $servers | Where-Object { $_.Name -eq $LocalName } | Select-Object -First 1
                     $picked = if ($local) { $local } else { $servers[0] }
+                    $version = Get-ExchangeServerVersion -Server $picked.Name
+                    return @{ Servers = $servers; Picked = $picked; Version = $version }
+                } -Parameters @{ LocalName = $env:COMPUTERNAME } -OnComplete {
+                    param($result)
+                    try {
+                        $servers = @($result.Servers)
+                        if ($servers.Count -eq 0) {
+                            $lblConnStatus.Text = 'Not connected'
+                            $lblConnStatus.ForeColor = [System.Drawing.Color]::Gray
+                            Update-StatusBar 'EMS detected but no Mailbox servers found'
+                            return
+                        }
+                        $picked = $result.Picked
+                        $ver = $result.Version
+                        $txtServer.Text = $picked.FQDN
+                        $autoComplete.Clear()
+                        foreach ($s in $servers) { [void]$autoComplete.Add($s.FQDN) }
 
-                    $txtServer.Text = $picked.FQDN
-                    $autoComplete.Clear()
-                    foreach ($s in $servers) { [void]$autoComplete.Add($s.FQDN) }
-
-                    # Auto-connect (EMS - no remote session needed)
-                    $script:Session = @{ IsEMS = $true; Server = $picked.FQDN }
-                    $ver = Get-ExchangeServerVersion -Server $picked.Name
-                    $lblConnStatus.Text = "EMS: $($picked.Name) ($($ver.AdminVersion))"
-                    $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
-                    $btnDisconnect.Visible = $true
-                    try { Write-OperatorLog -Action 'AutoConnect-EMS' -Target $picked.Name } catch {}
-                    Update-StatusBar "Auto-connected via EMS - $($picked.Name) ($($ver.Edition) $($ver.AdminVersion)) | $($servers.Count) server(s) found"
-                } else {
-                    Update-StatusBar 'EMS detected but no Mailbox servers found'
+                        # Auto-connect (EMS - snap-in is available to job runspaces)
+                        $script:Session = @{ IsEMS = $true; Server = $picked.FQDN }
+                        $lblConnStatus.Text = "EMS: $($picked.Name) ($($ver.AdminVersion))"
+                        $lblConnStatus.ForeColor = [System.Drawing.Color]::Green
+                        $btnDisconnect.Visible = $true
+                        try { Write-OperatorLog -Action 'AutoConnect-EMS' -Target $picked.Name } catch {}
+                        Update-StatusBar "Auto-connected via EMS - $($picked.Name) ($($ver.Edition) $($ver.AdminVersion)) | $($servers.Count) server(s) found"
+                    } catch { Update-StatusBar "EMS auto-detect UI error: $_" }
+                } -OnError {
+                    param($err)
+                    $lblConnStatus.Text = 'Not connected'
+                    $lblConnStatus.ForeColor = [System.Drawing.Color]::Gray
+                    Update-StatusBar "EMS auto-detect: $err"
                 }
             }
         } catch {
